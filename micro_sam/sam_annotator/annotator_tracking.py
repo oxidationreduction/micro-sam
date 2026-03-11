@@ -112,7 +112,6 @@ def create_tracking_menu(points_layer, box_layer, states, track_ids, tracking_wi
 
 
 class AnnotatorTracking(_AnnotatorBase):
-
     # The tracking annotator needs different settings for the prompt layers
     # to support the additional tracking state.
     # That's why we over-ride this function.
@@ -233,7 +232,7 @@ class AnnotatorTracking(_AnnotatorBase):
         # NOTE: Check whether it exists already from `_require_layers` or needs to be created.
         if state.widgets.get("tracking") is None:
             self._tracking_widget = create_tracking_menu(
-                ponts_layer=self._point_prompt_layer,
+                points_layer=self._point_prompt_layer,
                 box_layer=self._box_prompt_layer,
                 states=self._track_state_labels,
                 track_ids=list(state.lineage.keys()),

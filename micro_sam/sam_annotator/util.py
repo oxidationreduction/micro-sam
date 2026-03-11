@@ -9,9 +9,11 @@ from typing import List, Optional, Tuple
 import h5py
 import napari
 import numpy as np
+import torch
 from skimage import draw
 from scipy.ndimage import shift
 
+from .z_memory_adapter import get_embedding_tensor
 from .. import prompt_based_segmentation, util
 from .. import _model_settings as model_settings
 from ..multi_dimensional_segmentation import _validate_projection
@@ -355,6 +357,7 @@ def segment_slices_with_prompts(
     image_shape = shape[1:]
     seg = np.zeros(shape, dtype="uint32")
 
+    # 从point/box prompt中提取z坐标（slice索引）
     z_values = np.round(point_prompts.data[:, 0])
     z_values_boxes = np.concatenate([box[:1, 0] for box in box_prompts.data]) if box_prompts.data else\
         np.zeros(0, dtype="int")
@@ -369,6 +372,7 @@ def segment_slices_with_prompts(
             assert len(track_ids_boxes) == len(z_values_boxes), f"{len(track_ids_boxes)}, {len(z_values_boxes)}"
             z_values_boxes = z_values_boxes[track_ids_boxes == track_id]
 
+    # 所有含有prompt的slice索引
     slices = np.unique(np.concatenate([z_values, z_values_boxes])).astype("int")
     stop_lower, stop_upper = False, False
 
@@ -582,6 +586,7 @@ def _shift_object(mask, motion_model):
 def track_from_prompts(
     point_prompts, box_prompts, seg, predictor, slices, image_embeddings,
     stop_upper, threshold, projection, motion_smoothing=0.5, box_extension=0, update_progress=None,
+    memory_adapter=None, device='cuda'
 ):
     """@private
     """
@@ -632,13 +637,42 @@ def track_from_prompts(
             seg_prev = seg[t - 1]
             # shift the segmentation according to the motion model
             if motion_model is not None:
-                seg_prev = _shift_object(seg_prev, motion_model)
+                seg_prev_shifted = _shift_object(seg_prev, motion_model)
+            else:
+                seg_prev_shifted = seg_prev
 
-            seg_t = prompt_based_segmentation.segment_from_mask(
-                predictor, seg_prev, image_embeddings=image_embeddings, i=t,
-                use_mask=use_mask, use_box=use_box, use_points=use_points,
-                box_extension=box_extension, use_single_point=use_single_point,
-            )
+            if memory_adapter is not None:
+                with torch.no_grad():
+                    # 1. 从预计算的 image_embeddings 中提取当前层(t)和上一层(t-1)的特征
+                    # 注意：具体获取特征的方式取决于 micro_sam 的版本，通常 image_embeddings['features'][t] 可以拿到
+                    curr_embed = get_embedding_tensor(image_embeddings, t).to(device)
+                    prev_embed = get_embedding_tensor(image_embeddings, t - 1).to(device)
+
+                    # 2. 将上一层的 Mask 降采样到 64x64 (SAM特征图大小)
+                    prev_mask_tensor = torch.tensor(seg_prev).unsqueeze(0).unsqueeze(0).float().to(device)
+                    prev_mask_low_res = torch.nn.functional.interpolate(prev_mask_tensor, size=(64, 64))
+
+                    # 3. 通过 Adapter 融合记忆
+                    fused_embed = memory_adapter(curr_embed, prev_embed, prev_mask_low_res)
+
+                    # 4. 强行劫持 predictor 的特征
+                    predictor.features = fused_embed
+                    predictor.is_image_set = True
+
+                    # 5. 调用改造后的分割函数 (这里依然可以传入 shift 后的 mask 作为 Dense Prompt)
+                    seg_t = prompt_based_segmentation.segment_from_mask(
+                        predictor, seg_prev_shifted, image_embeddings=image_embeddings, i=t,
+                        use_mask=use_mask, use_box=use_box, use_points=use_points,
+                        box_extension=box_extension, use_single_point=use_single_point,
+                    )
+            else:
+                # 回退到原始的 micro-sam 逻辑
+                seg_t = prompt_based_segmentation.segment_from_mask(
+                    predictor, seg_prev_shifted, image_embeddings=image_embeddings, i=t,
+                    use_mask=use_mask, use_box=use_box, use_points=use_points,
+                    box_extension=box_extension, use_single_point=use_single_point,
+                )
+
             track_state = "track"
 
             # are we beyond the last slice with prompt?
@@ -649,6 +683,7 @@ def track_from_prompts(
 
             update_progress(1)
 
+        # 如果当前层的分割与上一层重叠度（IOU）低于阈值（threshold），跟踪会停止，以避免错误传播
         if (threshold is not None) and (seg_prev is not None):
             iou = util.compute_iou(seg_prev, seg_t)
             if iou < threshold:
@@ -668,7 +703,7 @@ def track_from_prompts(
         if t == slices[-1] and stop_upper:
             break
 
-        # stop if we are at the last slce
+        # stop if we are at the last slice
         if t == seg.shape[0]:
             break
 

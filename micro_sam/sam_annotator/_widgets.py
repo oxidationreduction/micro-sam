@@ -38,6 +38,7 @@ from .. import instance_segmentation, util
 from ..multi_dimensional_segmentation import (
     segment_mask_in_volume, merge_instance_segmentation_3d, track_across_frames, PROJECTION_MODES, get_napari_track_data
 )
+from .z_memory_adapter import ZMemoryAdapter
 
 
 #
@@ -1549,6 +1550,19 @@ class SegmentNDWidget(_WidgetBase):
 
     def _run_tracking(self):
         state = AnnotatorState()
+        if not hasattr(state, "memory_adapter") or state.memory_adapter is None:
+            print("初始化 ZMemoryAdapter...")
+            # 假设你的特征维度是 256 (SAM 的默认值)
+            state.memory_adapter = ZMemoryAdapter(embed_dim=256).to("cuda")
+
+            # 如果你未来微调训练好了模型，在这里加载权重：
+            # weight_path = "/path/to/your/trained_adapter.pth"
+            # if os.path.exists(weight_path):
+            #     state.memory_adapter.load_state_dict(torch.load(weight_path))
+            #     print("成功加载 ZMemoryAdapter 权重！")
+
+            # 必须设置为评估模式，否则 batchnorm/dropout 会捣乱
+            state.memory_adapter.eval()
         pbar, pbar_signals = _create_pbar_for_threadworker()
 
         # @thread_worker
@@ -1573,6 +1587,7 @@ class SegmentNDWidget(_WidgetBase):
                 motion_smoothing=self.motion_smoothing,
                 box_extension=self.box_extension,
                 update_progress=lambda update: pbar_signals.pbar_update.emit(update),
+                memory_adapter=state.memory_adapter
             )
 
             pbar_signals.pbar_stop.emit()
@@ -1606,6 +1621,9 @@ class SegmentNDWidget(_WidgetBase):
         # @thread_worker
         def volumetric_segmentation_impl():
             state = AnnotatorState()
+            if not hasattr(state, "memory_adapter") or state.memory_adapter is None:
+                state.memory_adapter = ZMemoryAdapter(embed_dim=256).to("cuda")
+                state.memory_adapter.eval()
             shape = state.image_shape
 
             pbar_signals.pbar_total.emit(shape[0])
@@ -1625,6 +1643,7 @@ class SegmentNDWidget(_WidgetBase):
                 iou_threshold=self.iou_threshold, projection=self.projection,
                 box_extension=self.box_extension,
                 update_progress=lambda update: pbar_signals.pbar_update.emit(update),
+                memory_adapter=state.memory_adapter
             )
             pbar_signals.pbar_stop.emit()
 

@@ -20,6 +20,8 @@ from elf.tracking.motile_tracking import recolor_segmentation
 
 from segment_anything.predictor import SamPredictor
 
+from .sam_annotator.util import get_embedding_tensor
+
 try:
     from napari.utils import progress as tqdm
 except ImportError:
@@ -109,8 +111,9 @@ def segment_mask_in_volume(
     update_progress: Optional[callable] = None,
     box_extension: float = 0.0,
     verbose: bool = False,
+    memory_adapter = None
 ) -> Tuple[np.ndarray, Tuple[int, int]]:
-    """Segment an object mask in in volumetric data.
+    """Segment an object mask in volumetric data.
 
     Args:
         segmentation: The initial segmentation for the object.
@@ -118,10 +121,10 @@ def segment_mask_in_volume(
         image_embeddings: The precomputed image embeddings for the volume.
         segmented_slices: List of slices for which this object has already been segmented.
         stop_lower: Whether to stop at the lowest segmented slice.
-        stop_upper: Wheter to stop at the topmost segmented slice.
+        stop_upper: Whether to stop at the topmost segmented slice.
         iou_threshold: The IOU threshold for continuing segmentation across 3d.
         projection: The projection method to use. One of 'box', 'mask', 'points', 'points_and_mask' or 'single point'.
-            Pass a dictionary to choose the excact combination of projection modes.
+            Pass a dictionary to choose the exact combination of projection modes.
         update_progress: Callback to update an external progress bar.
         box_extension: Extension factor for increasing the box size after projection.
             By default, does not increase the projected box size.
@@ -131,23 +134,57 @@ def segment_mask_in_volume(
         Array with the volumetric segmentation.
         Tuple with the first and last segmented slice.
     """
+    # 验证projection模式，确定使用哪些prompt类型（mask, box, points等）
+    # 这决定了如何从上一层的分割结果生成prompt传递给SAM
     use_box, use_mask, use_points, use_single_point = _validate_projection(projection)
 
+    # 如果没有提供进度更新函数，定义一个空函数
     if update_progress is None:
         def update_progress(*args):
             pass
 
+    # 定义内部函数segment_range，用于在指定范围内逐步分割slice
+    # 思路：从z_start开始，按照increment方向（+1或-1）逐步向z_stop扩展
+    # 每次使用上一层的分割结果作为mask prompt，通过SAM分割当前层
+    # 如果IOU低于阈值，则停止扩展，以避免错误传播
     def segment_range(z_start, z_stop, increment, stopping_criterion, threshold=None, verbose=False):
-        z = z_start + increment
+        z = z_start + increment  # 从起始点开始，移动到下一层
         while True:
             if verbose:
                 print(f"Segment {z_start} to {z_stop}: segmenting slice {z}")
+            # 获取上一层的分割结果，作为prompt
             seg_prev = segmentation[z - increment]
+            if memory_adapter is not None:
+                device = "cuda"  # 确保一切都在 GPU 上运行
+                with torch.no_grad():
+                    # 1. 提取当前层 (z) 和 参考层 (z - increment) 的原始特征
+                    curr_embed = get_embedding_tensor(image_embeddings, z).to(device)
+                    prev_embed = get_embedding_tensor(image_embeddings, z - increment).to(device)
+
+                    # 2. 将参考层的 2D Mask 转换为 Adapter 需要的低分辨率张量
+                    # 先转成 tensor 并增加 batch 和 channel 维度: [1, 1, H, W]
+                    prev_mask_tensor = torch.tensor(seg_prev).unsqueeze(0).unsqueeze(0).float().to(device)
+                    # 使用双线性插值降采样到 SAM 特征图的默认尺寸 64x64
+                    prev_mask_low_res = torch.nn.functional.interpolate(
+                        prev_mask_tensor, size=(64, 64), mode='bilinear'
+                    )
+                    # 二值化，确保它是一个清晰的 0/1 掩码
+                    prev_mask_low_res = (prev_mask_low_res > 0.5).float()
+
+                    # 3. 调用 Adapter 网络计算 fused_embed！
+                    fused_embed = memory_adapter(curr_embed, prev_embed, prev_mask_low_res)
+
+                    # 4. 强行把 SAM Predictor 肚子里的特征替换成我们的增强版特征
+                    predictor.features = fused_embed
+                    predictor.is_image_set = True
+            # 使用SAM的segment_from_mask函数，基于上一层mask生成当前层的分割
+            # projection模式控制如何使用mask（例如，是否结合box或points）
             seg_z, score, _ = segment_from_mask(
                 predictor, seg_prev, image_embeddings=image_embeddings, i=z, use_mask=use_mask,
                 use_box=use_box, use_points=use_points, box_extension=box_extension, return_all=True,
                 use_single_point=use_single_point,
             )
+            # 如果设置了阈值，计算IOU，如果低于阈值则停止
             if threshold is not None:
                 iou = util.compute_iou(seg_prev, seg_z)
                 if iou < threshold:
@@ -156,48 +193,62 @@ def segment_mask_in_volume(
                         print(msg)
                     break
 
+            # 将分割结果保存到segmentation数组
             segmentation[z] = seg_z
+            # 移动到下一层
             z += increment
+            # 检查是否达到停止条件（例如，z >= z_stop）
             if stopping_criterion(z, z_stop):
                 if verbose:
                     print(f"Segment {z_start} to {z_stop}: stop at slice {z}")
                 break
+            # 更新进度
             update_progress(1)
 
+        # 返回最后分割的slice索引
         return z - increment
 
+    # 获取已分割slice的范围：z0是最小slice索引，z1是最大slice索引
     z0, z1 = int(segmented_slices.min()), int(segmented_slices.max())
 
-    # segment below the min slice
+    # 第一步：分割低于z0的slice（向下扩展）
+    # 思路：如果z0 > 0且不强制停止，则从z0向下扩展到slice 0
+    # 使用segment_range函数，increment=-1（向下），直到z < 0
     if z0 > 0 and not stop_lower:
         z_min = segment_range(z0, 0, -1, np.less, iou_threshold, verbose=verbose)
     else:
-        z_min = z0
+        z_min = z0  # 如果不能扩展，z_min设为z0
 
-    # segment above the max slice
+    # 第二步：分割高于z1的slice（向上扩展）
+    # 思路：如果z1 < 总slice数-1且不强制停止，则从z1向上扩展到最后slice
+    # 使用segment_range函数，increment=1（向上），直到z > 最后索引
     if z1 < segmentation.shape[0] - 1 and not stop_upper:
         z_max = segment_range(z1, segmentation.shape[0] - 1, 1, np.greater, iou_threshold, verbose=verbose)
     else:
-        z_max = z1
+        z_max = z1  # 如果不能扩展，z_max设为z1
 
-    # segment in between min and max slice
+    # 第三步：分割z0和z1之间的slice（填充中间gap）
+    # 思路：遍历segmented_slices的相邻对，处理不同间距情况
+    # 目的是确保所有slice都被分割，即使有gap
     if z0 != z1:
         for z_start, z_stop in zip(segmented_slices[:-1], segmented_slices[1:]):
-            slice_diff = z_stop - z_start
-            z_mid = int((z_start + z_stop) // 2)
+            slice_diff = z_stop - z_start  # 计算间距
+            z_mid = int((z_start + z_stop) // 2)  # 中间slice索引
 
-            if slice_diff == 1:  # the slices are adjacent -> we don't need to do anything
+            if slice_diff == 1:  # 相邻slice，无需操作
                 pass
 
-            elif z_start == z0 and stop_lower:  # the lower slice is stop: we just segment from upper
+            elif z_start == z0 and stop_lower:  # 下边界是stop，从上向下分割
                 segment_range(z_stop, z_start, -1, np.less_equal, verbose=verbose)
 
-            elif z_stop == z1 and stop_upper:  # the upper slice is stop: we just segment from lower
+            elif z_stop == z1 and stop_upper:  # 上边界是stop，从下向上分割
                 segment_range(z_start, z_stop, 1, np.greater_equal, verbose=verbose)
 
-            elif slice_diff == 2:  # there is only one slice in between -> use combined mask
-                z = z_start + 1
+            elif slice_diff == 2:  # 间距为2，只有一个中间slice，使用组合mask
+                z = z_start + 1  # 中间slice
+                # 组合z_start和z_stop的mask，作为prompt（逻辑或操作）
                 seg_prompt = np.logical_or(segmentation[z_start] == 1, segmentation[z_stop] == 1)
+                # 使用组合mask分割中间slice
                 segmentation[z] = segment_from_mask(
                     predictor, seg_prompt, image_embeddings=image_embeddings, i=z,
                     use_mask=use_mask, use_box=use_box, use_points=use_points,
@@ -205,17 +256,14 @@ def segment_mask_in_volume(
                 )
                 update_progress(1)
 
-            else:  # there is a range of more than 2 slices in between -> segment ranges
-                # segment from bottom
+            else:  # 间距>2，范围分割
+                # 从下向上分割到z_mid
                 segment_range(
                     z_start, z_mid, 1, np.greater_equal if slice_diff % 2 == 0 else np.greater, verbose=verbose
                 )
-                # segment from top
+                # 从上向下分割到z_mid
                 segment_range(z_stop, z_mid, -1, np.less_equal, verbose=verbose)
-                # if the difference between start and stop is even,
-                # then we have a slice in the middle that is the same distance from top bottom
-                # in this case the slice is not segmented in the ranges above, and we segment it
-                # using the combined mask from the adjacent top and bottom slice as prompt
+                # 如果间距偶数，中间slice未被分割，使用相邻slice的组合mask
                 if slice_diff % 2 == 0:
                     seg_prompt = np.logical_or(segmentation[z_mid - 1] == 1, segmentation[z_mid + 1] == 1)
                     segmentation[z_mid] = segment_from_mask(
@@ -225,6 +273,7 @@ def segment_mask_in_volume(
                     )
                     update_progress(1)
 
+    # 返回更新后的segmentation和扩展后的范围(z_min, z_max)
     return segmentation, (z_min, z_max)
 
 
