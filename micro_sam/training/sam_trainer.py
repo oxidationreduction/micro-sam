@@ -138,7 +138,7 @@ class SamTrainer(torch_em.trainer.DefaultTrainer):
 
         # Loop over the batch.
         for batch_output, targets in zip(batched_outputs, y_one_hot):
-
+            # predicted_objects -> (n_obj, 3, 512, 512)
             predicted_objects = torch.sigmoid(batch_output["masks"])
             # Compute the dice scores for the 1 or 3 predicted masks per true object (outer loop).
             # We swap the axes that go into the dice loss so that the object axis
@@ -146,10 +146,10 @@ class SamTrainer(torch_em.trainer.DefaultTrainer):
             # independetly per channel. We do not reduce the channel axis in the dice,
             # so that we can take the minimum (best score) of the 1/3 predicted masks per object.
             dice_scores = torch.stack([
-                self.loss(predicted_objects[:, i:i+1].swapaxes(0, 1), targets.swapaxes(0, 1))
+                self.loss(predicted_objects[:, i:i+1].swapaxes(0, 1), targets.swapaxes(0, 1)) # (n_obj)
                 for i in range(predicted_objects.shape[1])
             ])
-            dice_scores, _ = torch.min(dice_scores, dim=0)
+            dice_scores, _ = torch.min(dice_scores, dim=0) # (3, n_obj)
 
             # Compute the actual IOU between the predicted and true objects.
             # The outer loop is for the 1 or 3 predicted masks per true object.
@@ -244,6 +244,7 @@ class SamTrainer(torch_em.trainer.DefaultTrainer):
         """Compute the loss for several (sub-)iterations of iterative prompting.
         In each iterations the prompts are updated based on the previous predictions.
         """
+        # image_embeddings -> (2, 256, 64, 64)
         image_embeddings, batched_inputs = self.model.image_embeddings_oft(batched_inputs)
 
         loss, mask_loss, iou_regression_loss, mean_model_iou = 0.0, 0.0, 0.0, 0.0
@@ -363,8 +364,8 @@ class SamTrainer(torch_em.trainer.DefaultTrainer):
         batched_inputs, y_one_hot = self._preprocess_batch(batched_inputs, y, sampled_ids)
 
         loss, mask_loss, iou_regression_loss, model_iou = self._compute_iterative_loss(
-            batched_inputs=batched_inputs,
-            y_one_hot=y_one_hot,
+            batched_inputs=batched_inputs, # image -> (3, 512, 512)
+            y_one_hot=y_one_hot, # y_one_hot -> (B, n_obj, 1, 512, 512)
             num_subiter=self.n_sub_iteration,
             multimask_output=multimask_output
         )

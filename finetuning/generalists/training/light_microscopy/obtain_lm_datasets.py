@@ -12,6 +12,7 @@ from torch_em.data import MinInstanceSampler, ConcatDataset
 from torch_em.transform.label import PerObjectDistanceTransform
 from torch_em.data.datasets.light_microscopy.neurips_cell_seg import to_rgb
 
+from finetuning.generalists.training.light_microscopy.seq_wrapper import SyntheticSequenceWrapper
 from micro_sam.training.util import ResizeRawTrafo, ResizeLabelTrafo
 
 
@@ -64,7 +65,8 @@ def get_concat_lm_datasets(input_path, patch_shape, split_choice):
         label_transform = PerObjectDistanceTransform(
             distances=True, boundary_distances=True, directed_distances=False, foreground=True, instances=True,
         )
-        return label_transform
+        # return label_transform
+        return None
 
     def get_livecell_datasets():
         "Datasets for cell segmentation in phase contrast microscopy images."
@@ -101,7 +103,7 @@ def get_concat_lm_datasets(input_path, patch_shape, split_choice):
         all_yeaz_datasets = [
             datasets.get_yeaz_dataset(
                 path=os.path.join(input_path, "yeaz"), patch_shape=patch_shape, raw_transform=_to_8bit,
-                ndim=2, download=True, split=split_choice, choice=name, label_transform=_get_label_transform(),
+                ndim=2, download=False, split=split_choice, choice=name, label_transform=_get_label_transform(),
                 sampler=sampler, label_dtype=label_dtype,
             ) for name in names
         ]
@@ -111,7 +113,7 @@ def get_concat_lm_datasets(input_path, patch_shape, split_choice):
         "Datasets for cell and nuclei segmentation in fluorescence microscopy images."
         # NOTE: We create random splits for this dataset for training the generalist.
         raw_paths, label_paths = datasets.cvz_fluo.get_cvz_fluo_paths(
-            path=os.path.join(input_path, "cvz"), stain_choice=stain_choice,
+            path=os.path.join(input_path, "cvz"), stain_choice=stain_choice, download=True
         )
         train_raw_paths, test_raw_paths, train_label_paths, test_label_paths = train_test_split(
             raw_paths, label_paths, test_size=0.2, random_state=42,
@@ -142,13 +144,13 @@ def get_concat_lm_datasets(input_path, patch_shape, split_choice):
 
     _datasets = [
         # cell segmentation in tissue microscopy images.
-        datasets.get_tissuenet_dataset(
-            path=os.path.join(input_path, "tissuenet"), split=split_choice, download=True, patch_shape=patch_shape,
-            raw_channel="rgb", label_channel="cell", label_transform=ResizeLabelTrafo(patch_shape),
-            # NOTE: Below is done for TissueNet: to work with the valid channels (i.e. the first and second channels).
-            raw_transform=ResizeRawTrafo((3, *patch_shape), do_rescaling=True, valid_channels=(0, 1)),
-            n_samples=500 if split_choice == "train" else 100, sampler=sampler, label_dtype=label_dtype,
-        ),
+        # datasets.get_tissuenet_dataset(
+        #     path=os.path.join(input_path, "tissuenet"), split=split_choice, download=True, patch_shape=patch_shape,
+        #     raw_channel="rgb", label_channel="cell", label_transform=ResizeLabelTrafo(patch_shape),
+        #     # NOTE: Below is done for TissueNet: to work with the valid channels (i.e. the first and second channels).
+        #     raw_transform=ResizeRawTrafo((3, *patch_shape), do_rescaling=True, valid_channels=(0, 1)),
+        #     n_samples=500 if split_choice == "train" else 100, sampler=sampler, label_dtype=label_dtype,
+        # ),
         # bacteria segmentation in label-free microscopy images.
         datasets.get_deepbacs_dataset(
             path=os.path.join(input_path, "deepbacs"), split=split_choice, patch_shape=patch_shape,
@@ -156,17 +158,17 @@ def get_concat_lm_datasets(input_path, patch_shape, split_choice):
             download=True, sampler=MinInstanceSampler(min_num_instances=4, min_size=10)
         ),
         # cell segmentation in confocal microscopy images.
-        datasets.get_plantseg_dataset(
-            path=os.path.join(input_path, "plantseg"), name="root", n_samples=500 if split_choice == "train" else 100,
-            patch_shape=(1, *patch_shape), download=True, ndim=2, raw_transform=ResizeRawTrafo((3, *patch_shape)),
-            sampler=MinInstanceSampler(min_num_instances=4, min_size=10), split=split_choice, label_dtype=label_dtype,
-            label_transform=ResizeLabelTrafo(patch_shape),
-        ),
+        # datasets.get_plantseg_dataset(
+        #     path=os.path.join(input_path, "plantseg"), name="root", n_samples=500 if split_choice == "train" else 100,
+        #     patch_shape=(1, *patch_shape), download=True, ndim=3, raw_transform=ResizeRawTrafo((3, *patch_shape)),
+        #     sampler=MinInstanceSampler(min_num_instances=4, min_size=10), split=split_choice, label_dtype=label_dtype,
+        #     label_transform=ResizeLabelTrafo(patch_shape),
+        # ),
         # cell segmentation in multi-modal microscopy images.
         datasets.get_neurips_cellseg_supervised_dataset(
             root=os.path.join(input_path, "neurips_cellseg"), split=split_choice, label_dtype=label_dtype,
             patch_shape=patch_shape, raw_transform=_to_8bit, label_transform=_get_label_transform(),
-            sampler=MinInstanceSampler(min_num_instances=3, min_size=10), download=True,
+            sampler=MinInstanceSampler(min_num_instances=3, min_size=10), download=False,
         ),
         # nuclei segmentation in fluorescence microscopy images.
         datasets.get_dsb_dataset(
@@ -175,17 +177,17 @@ def get_concat_lm_datasets(input_path, patch_shape, split_choice):
             label_dtype=label_dtype, download=True, raw_transform=_identity,
         ),
         # nuclei segmentation in fluorescence microscopy images.
-        datasets.get_dynamicnuclearnet_dataset(
-            path=os.path.join(input_path, "dynamicnuclearnet"), patch_shape=patch_shape, download=True, sampler=sampler,
-            split=split_choice, n_samples=500 if split_choice == "train" else 100, label_dtype=label_dtype,
-            raw_transform=_to_8bit, label_transform=_get_label_transform(),
-        ),
+        # datasets.get_dynamicnuclearnet_dataset(
+        #     path=os.path.join(input_path, "dynamicnuclearnet"), patch_shape=patch_shape, download=True, sampler=sampler,
+        #     split=split_choice, n_samples=500 if split_choice == "train" else 100, label_dtype=label_dtype,
+        #     raw_transform=_to_8bit, label_transform=_get_label_transform(),
+        # ),
         # cell segmentation in multiple microscopy imaging modalities.
-        datasets.get_cellpose_dataset(
-            path=os.path.join(input_path, "cellpose"), patch_shape=patch_shape, choice="cyto", sampler=sampler,
-            download=True, split=split_choice if split_choice == "train" else "test", label_dtype=label_dtype,
-            label_transform=_get_label_transform(), raw_transform=_cellpose_raw_trafo,
-        ),
+        # datasets.get_cellpose_dataset(
+        #     path=os.path.join(input_path, "cellpose"), patch_shape=patch_shape, choice="cyto", sampler=sampler,
+        #     download=True, split=split_choice if split_choice == "train" else "test", label_dtype=label_dtype,
+        #     label_transform=_get_label_transform(), raw_transform=_cellpose_raw_trafo,
+        # ),
         # bacteria segmentation in phase contrast and fluorescence microscopy images.
         # worm segmentation in brightfield microscopy images.
         datasets.get_omnipose_dataset(
@@ -193,7 +195,7 @@ def get_concat_lm_datasets(input_path, patch_shape, split_choice):
             split=split_choice if split_choice == "train" else "test", sampler=sampler,
             label_dtype=label_dtype, raw_transform=_to_8bit, label_transform=_get_label_transform(),
         ),
-        # organoid segmentation in brightfield microscopy images.
+        # # organoid segmentation in brightfield microscopy images.
         datasets.get_orgasegment_dataset(
             path=os.path.join(input_path, "orgasegment"), patch_shape=patch_shape, download=True, split=split_choice,
             raw_transform=_identity, label_transform=_get_label_transform(), label_dtype=label_dtype, sampler=sampler,
@@ -201,17 +203,17 @@ def get_concat_lm_datasets(input_path, patch_shape, split_choice):
     ]
 
     # Add LIVECell dataset: cell segmentation for phase contrast microscopy images.
-    _datasets.extend(get_livecell_datasets())
+    # _datasets.extend(get_livecell_datasets())
 
     # Add EmbedSeg datasets: cell and nuclei segmentation for fluorescence microscopy images.
-    _datasets.extend(get_embedseg_datasets())
+    # _datasets.extend(get_embedseg_datasets())
 
     # Add YeaZ datasets: yeast segmentation for brightfield and phase contrast microscopy images.
-    _datasets.extend(get_yeaz_dataset())
+    # _datasets.extend(get_yeaz_dataset())
 
     # Add CVZ Fluo datasets: cell and nuclei segmentation for fluorescence microscopy images.
-    _datasets.extend(get_cvz_dataset("cell"))
-    _datasets.extend(get_cvz_dataset("dapi"))
+    # _datasets.extend(get_cvz_dataset("cell"))
+    # _datasets.extend(get_cvz_dataset("dapi"))
 
     # Add CTC datasets: cell segmentation for various
     if split_choice == "train":  # NOTE: We use CTC only for training.
@@ -220,12 +222,12 @@ def get_concat_lm_datasets(input_path, patch_shape, split_choice):
     generalist_dataset = ConcatDataset(*_datasets)
 
     # Increasing the sampling attempts for the NeurIPS CellSeg dataset.
-    generalist_dataset.datasets[3].max_sampling_attempts = 5000
+    # generalist_dataset.datasets[1].max_sampling_attempts = 5000
 
     return generalist_dataset
 
 
-def get_generalist_lm_loaders(input_path, patch_shape):
+def get_generalist_lm_loaders(input_path, patch_shape, batch_size=2):
     """This returns the concatenated light microscopy datasets implemented in `torch_em`:
     https://github.com/constantinpape/torch-em/tree/main/torch_em/data/datasets/light_microscopy.
     It will automatically download all the datasets, except:
@@ -240,11 +242,17 @@ def get_generalist_lm_loaders(input_path, patch_shape):
     IMPORTANT: the ID 0 is reserved for background, and the IDs must be consecutive.
     """
     # Get the datasets.
-    generalist_train_dataset = get_concat_lm_datasets(input_path, patch_shape, "train")
-    generalist_val_dataset = get_concat_lm_datasets(input_path, patch_shape, "val")
+    patch_shape_2d = patch_shape[1:]  if len(patch_shape) == 3 else patch_shape
+    generalist_train_dataset = get_concat_lm_datasets(input_path, patch_shape_2d, "train")
+    generalist_val_dataset = get_concat_lm_datasets(input_path, patch_shape_2d, "val")
+
+    if len(patch_shape) == 3:
+        # If the patch shape is 3D, we wrap the datasets in a sequence wrapper that creates synthetic sequences.
+        generalist_train_dataset = SyntheticSequenceWrapper(generalist_train_dataset, seq_len=patch_shape[0])
+        generalist_val_dataset = SyntheticSequenceWrapper(generalist_val_dataset, seq_len=patch_shape[0])
 
     # Get the dataloaders.
-    train_loader = torch_em.get_data_loader(generalist_train_dataset, batch_size=2, shuffle=True, num_workers=16)
-    val_loader = torch_em.get_data_loader(generalist_val_dataset, batch_size=1, shuffle=True, num_workers=16)
+    train_loader = torch_em.get_data_loader(generalist_train_dataset, batch_size=batch_size, shuffle=True, num_workers=24)
+    val_loader = torch_em.get_data_loader(generalist_val_dataset, batch_size=max(1, batch_size >> 1), shuffle=True, num_workers=24)
 
     return train_loader, val_loader

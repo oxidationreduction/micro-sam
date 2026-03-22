@@ -265,6 +265,148 @@ class ConvertToSamInputs:
         return batched_inputs, batched_sampled_cell_ids_list
 
 
+class ConvertToMemSamInputs:
+    """Convert outputs of data loader to the expected batched inputs of the Segment Anything model.
+
+    Args:
+        transform: The transformation to resize the prompts. Should be the same transform used in the
+            model to resize the inputs. If `None` the prompts will not be resized.
+        dilation_strength: The dilation factor.
+            It determines a "safety" border from which prompts are not sampled to avoid ambiguous prompts
+            due to imprecise groundtruth masks. By default, set to '10'.
+        box_distortion_factor: Factor for distorting the box annotations derived from the groundtruth masks.
+    """
+
+    def __init__(
+            self,
+            transform,  # 实际使用时应标注为 Optional[ResizeLongestSide]
+            dilation_strength: int = 10,
+            box_distortion_factor: Optional[float] = None,
+    ) -> None:
+        self.dilation_strength = dilation_strength
+        # 为了避免依赖缺失报错，这里假设 global 有 identity 函数，实际按照原版代码即可
+        self.transform = transform if transform is not None else lambda x: x
+        self.box_distortion_factor = box_distortion_factor
+
+    def _distort_boxes(self, bbox_coordinates, shape):
+        distorted_boxes = []
+        for bbox in bbox_coordinates:
+            # The bounding box is parametrized by y0, x0, y1, x1.
+            y0, x0, y1, x1 = bbox
+            ly, lx = y1 - y0, x1 - x0
+            y0 = int(round(max(0, y0 - np.random.uniform(0, self.box_distortion_factor) * ly)))
+            y1 = int(round(min(shape[0], y1 + np.random.uniform(0, self.box_distortion_factor) * ly)))
+            x0 = int(round(max(0, x0 - np.random.uniform(0, self.box_distortion_factor) * lx)))
+            x1 = int(round(min(shape[1], x1 + np.random.uniform(0, self.box_distortion_factor) * lx)))
+            distorted_boxes.append([y0, x0, y1, x1])
+        return distorted_boxes
+
+    def _get_prompt_lists(self, gt, n_samples, prompt_generator):
+        """Returns a list of "expected" prompts subjected to the random input attributes for prompting."""
+
+        # 此时传入的 gt 已经是严格的 2D 数组 (H, W)
+        _, bbox_coordinates = get_centers_and_bounding_boxes(gt, mode="p")
+
+        # get the segment ids
+        cell_ids = np.unique(gt)[1:]
+        if n_samples is None:  # n-samples is set to None, so we use all ids
+            sampled_cell_ids = cell_ids
+        else:  # n-samples is set, so we subsample the cell ids
+            sampled_cell_ids = np.random.choice(cell_ids, size=min(n_samples, len(cell_ids)), replace=False)
+            sampled_cell_ids = np.sort(sampled_cell_ids)
+
+        # only keep the bounding boxes for sampled cell ids
+        bbox_coordinates = [bbox_coordinates[sampled_id] for sampled_id in sampled_cell_ids]
+
+        # gt.shape[-2:] 现在安全地返回 (H, W)
+        if self.box_distortion_factor is not None:
+            bbox_coordinates = self._distort_boxes(bbox_coordinates, shape=gt.shape[-2:])
+
+        # convert the gt to the one-hot-encoded masks for the sampled cell ids
+        object_masks = segmentation_to_one_hot(gt, None if n_samples is None else sampled_cell_ids)
+
+        # derive and return the prompts
+        point_prompts, point_label_prompts, box_prompts, _ = prompt_generator(object_masks, bbox_coordinates)
+        return box_prompts, point_prompts, point_label_prompts, sampled_cell_ids
+
+    def __call__(self, x, y, n_pos, n_neg, get_boxes=False, n_samples=None):
+        """Convert the outputs of dataloader and prompt settings to the batch format expected by SAM.
+        """
+        if n_pos == 0 and n_neg == 0:
+            get_points = False
+        else:
+            get_points = True
+
+        # keeping the solution open by checking for deterministic/dynamic choice of point prompts
+        prompt_generator = PointAndBoxPromptGenerator(
+            n_positive_points=n_pos,
+            n_negative_points=n_neg,
+            dilation_strength=self.dilation_strength,
+            get_box_prompts=get_boxes,
+            get_point_prompts=get_points
+        )
+
+        batched_inputs = []
+        batched_sampled_cell_ids_list = []
+
+        for image, gt_tensor in zip(x, y):
+            # --- 【修复核心部位】 ---
+            # 原始代码: gt = gt.squeeze().numpy().astype(np.int64)
+            # 原始代码的漏洞在于：如果 gt 是 (4, 512, 512)，squeeze() 不会起任何作用，直接原样放行了。
+
+            gt = gt_tensor.numpy()
+
+            # 安全校验与通道切割
+            # 如果是多通道标签 (例如 torch_em 返回的 4 通道: Instance, Foreground, Dist1, Dist2)
+            if gt.ndim == 4:
+                # 强制只提取第 0 通道 (Instance IDs)，将其降维成纯粹的 2D 图像 (seq_len, H, W)
+                gt = gt[:, 0, ...]
+            elif gt.ndim == 3:
+                # 强制只提取第 0 通道 (Instance IDs)，将其降维成纯粹的 2D 图像 (H, W)
+                gt = gt[0]
+            elif gt.ndim == 2:
+                # 如果已经是单通道 (H, W) 则无需处理
+                pass
+            else:
+                raise ValueError(f"Unexpected label shape encountered: {gt.shape}")
+
+            # 转换为整型
+            gt = gt.astype(np.int64)
+            # ------------------------
+
+            box_prompts, point_prompts, point_label_prompts, sampled_cell_ids = self._get_prompt_lists(
+                gt, n_samples, prompt_generator,
+            )
+
+            # check to be sure about the expected size of the no. of elements in different settings
+            if get_boxes:
+                assert len(sampled_cell_ids) == len(box_prompts), f"{len(sampled_cell_ids)}, {len(box_prompts)}"
+
+            if get_points:
+                assert len(sampled_cell_ids) == len(point_prompts) == len(point_label_prompts), \
+                    f"{len(sampled_cell_ids)}, {len(point_prompts)}, {len(point_label_prompts)}"
+
+            batched_sampled_cell_ids_list.append(sampled_cell_ids)
+
+            batched_input = {"image": image, "original_size": image.shape[1:]}
+
+            # 使用 gt.shape[-2:] (即 H,W) 作为原始尺寸
+            if get_boxes:
+                batched_input["boxes"] = self.transform.apply_boxes_torch(
+                    box_prompts, original_size=gt.shape[-2:]
+                ) if getattr(self, 'transform', None) is not None else box_prompts
+
+            if get_points:
+                batched_input["point_coords"] = self.transform.apply_coords_torch(
+                    point_prompts, original_size=gt.shape[-2:]
+                ) if getattr(self, 'transform', None) is not None else point_prompts
+                batched_input["point_labels"] = point_label_prompts
+
+            batched_inputs.append(batched_input)
+
+        return batched_inputs, batched_sampled_cell_ids_list
+
+
 class ConvertToSemanticSamInputs:
     """Convert outputs of data loader to the expected batched inputs of the Segment Anything model
     for semantic segmentation.

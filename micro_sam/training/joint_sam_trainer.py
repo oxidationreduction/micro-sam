@@ -90,8 +90,10 @@ class JointSamTrainer(SamTrainer):
         n_iter = 0
         t_per_iter = time.time()
         for x, y in self.train_loader:
-            labels_instances = y[:, 0, ...].unsqueeze(1)
-            labels_for_unetr = y[:, 1:, ...]
+            # x -> (2, 3, 512, 512), y -> (2, 4, 512, 512)
+            # labels_instances -> (2, 1, 512, 512)
+            labels_instances = y[..., 0, :, :].unsqueeze(-3)
+            labels_for_unetr = y[..., 1:, :, :]
 
             input_check_done = self._check_input_normalization(x, input_check_done)
 

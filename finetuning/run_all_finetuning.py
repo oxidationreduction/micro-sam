@@ -13,7 +13,7 @@ N_OBJECTS = {
 
 
 def write_batch_script(out_path, _name, env_name, model_type, save_root, dry):
-    "Writing scripts with different micro-sam finetunings."
+    """Writing scripts with different micro-sam finetunings."""
     batch_script = f"""#!/bin/bash
 #SBATCH -t 14-00:00:00
 #SBATCH --nodes=1

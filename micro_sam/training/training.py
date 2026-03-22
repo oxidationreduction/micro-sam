@@ -26,13 +26,12 @@ try:
 except Exception:
     QObject = Any
 
-from . import sam_trainer as trainers
+from . import sam_trainer as trainers, MemorySamTrainer
 from ..instance_segmentation import get_unetr
 from ..models.peft_sam import ClassicalSurgery
 from . import joint_sam_trainer as joint_trainers
 from ..util import get_device, get_model_names, export_custom_sam_model, get_sam_model
-from .util import get_trainable_sam_model, ConvertToSamInputs, require_8bit, get_raw_transform
-
+from .util import get_trainable_sam_model, ConvertToSamInputs, require_8bit, get_raw_transform, ConvertToMemSamInputs
 
 FilePath = Union[str, os.PathLike]
 
@@ -41,7 +40,7 @@ def _check_loader(loader, with_segmentation_decoder, name=None, verify_n_labels_
     x, _ = next(iter(loader))
 
     # Raw data: check that we have 1 or 3 channels.
-    n_channels = x.shape[1]
+    n_channels = x.shape[-3]
     if n_channels not in (1, 3):
         raise ValueError(
             "Invalid number of channels for the input data from the data loader. "
@@ -86,7 +85,7 @@ def _check_loader(loader, with_segmentation_decoder, name=None, verify_n_labels_
         desc=f"Verifying labels in {name} dataloader",
         total=verify_n_labels_in_loader if verify_n_labels_in_loader is not None else None,
     ):
-        n_channels_y = y.shape[1]
+        n_channels_y = y.shape[-3]
         if with_segmentation_decoder:
             if n_channels_y != 4:
                 raise ValueError(
@@ -96,9 +95,10 @@ def _check_loader(loader, with_segmentation_decoder, name=None, verify_n_labels_
                 )
             # Check instance channel per sample in a batch
             for per_y_sample in y:
+                per_y_sample = per_y_sample[0] if per_y_sample.ndim == 4 else per_y_sample # (4, 512, 512)
                 _check_instance_channel(per_y_sample[0])
 
-            targets_min, targets_max = y[:, 1:].min(), y[:, 1:].max()
+            targets_min, targets_max = y[..., 1:, :, :].min(), y[..., 1:, :, :].max()
             if targets_min < 0 or targets_min > 1:
                 raise ValueError(
                     "Invalid value range in the target data from the value loader. "
@@ -373,6 +373,137 @@ def train_sam(
         minutes = int(t_run // 60)
         seconds = int(round(t_run % 60, 0))
         print("Training took", t_run, f"seconds (= {hours:02}:{minutes:02}:{seconds:02} hours)")
+
+
+def train_mem_sam(
+        name: str,
+        model_type: str,
+        train_loader: DataLoader,
+        val_loader: DataLoader,
+        memory_adapter: torch.nn.Module,  # [新增] 传入实例化的 Memory Adapter
+        seq_len: int = 3,  # [新增] 长序列时序训练的切片/帧数
+        n_epochs: int = 100,
+        early_stopping: Optional[int] = 10,
+        n_objects_per_batch: Optional[int] = 25,
+        checkpoint_path: Optional[Union[str, os.PathLike]] = None,
+        freeze: Optional[List[str]] = None,  # 强烈建议传入 ["image_encoder", "prompt_encoder"]
+        device: Optional[Union[str, torch.device]] = None,
+        lr: float = 1e-4,  # 针对 Memory Adapter 的主学习率
+        decoder_lr: float = 1e-6,  # [新增] 针对预训练 Mask Decoder 的微小学习率
+        n_sub_iteration: int = 8,
+        save_root: Optional[Union[str, os.PathLike]] = None,
+        mask_prob: float = 0.5,
+        n_iterations: Optional[int] = None,
+        scheduler_kwargs: Optional[Dict[str, Any]] = None,
+        save_every_kth_epoch: Optional[int] = None,
+        pbar_signals: Optional[Any] = None,
+        peft_kwargs: Optional[Dict] = None,
+        ignore_warnings: bool = True,
+        verify_n_labels_in_loader: Optional[int] = 50,
+        box_distortion_factor: Optional[float] = 0.025,
+        overwrite_training: bool = True,
+        strict_decoder_loading: bool = True,
+        **model_kwargs,
+) -> None:
+    """Run memory-augmented training for a SAM model."""
+    import warnings
+    # 简单的 warning filter context
+    class _filter_warnings:
+        def __init__(self, ignore):
+            self.ignore = ignore
+
+        def __enter__(self):
+            if self.ignore: warnings.filterwarnings("ignore")
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            if self.ignore: warnings.resetwarnings()
+
+    with _filter_warnings(ignore_warnings):
+        t_start = time.time()
+
+        # 注意：此处需要确保 train_loader 吐出的是 [B, seq_len, C, H, W] 的 3D 数据
+        if verify_n_labels_in_loader is not None:
+            _check_loader(train_loader, False, "train", verify_n_labels_in_loader)
+            _check_loader(val_loader, False, "val", verify_n_labels_in_loader)
+
+        device = get_device(device)
+
+        # 1. 获取模型 (此时 freeze 参数发挥作用，例如冻结 image_encoder)
+        model, state = get_trainable_sam_model(
+            model_type=model_type,
+            device=device,
+            freeze=freeze,
+            checkpoint_path=checkpoint_path,
+            return_state=True,
+            peft_kwargs=peft_kwargs,
+            **model_kwargs
+        )
+
+        # model = torch.nn.DataParallel(model, device_ids=[0, 1, 2])
+
+        memory_adapter.to(device)
+
+        convert_inputs = ConvertToMemSamInputs(transform=model.transform, box_distortion_factor=box_distortion_factor)
+
+        # 2. 构建 Parameter Groups (差异化学习率配置)
+        param_groups = []
+
+        # -- Mask Decoder 参数 (使用极小学习率微调) --
+        mask_decoder_params = [p for p in model.sam.mask_decoder.parameters() if p.requires_grad]
+        if mask_decoder_params:
+            param_groups.append({"params": mask_decoder_params, "lr": decoder_lr})
+
+        # -- Prompt Encoder 参数 (如果不冻结的话) --
+        prompt_encoder_params = [p for p in model.sam.prompt_encoder.parameters() if p.requires_grad]
+        if prompt_encoder_params:
+            param_groups.append({"params": prompt_encoder_params, "lr": lr})
+
+        # -- Memory Adapter 参数 (从头训练，使用正常学习率) --
+        param_groups.append({"params": memory_adapter.parameters(), "lr": lr})
+
+        # 4. 初始化优化器和调度器
+        # PyTorch 的 Optimizer 原生支持传入 param_groups (即 List[Dict])
+        optimizer = torch.optim.AdamW(param_groups)
+
+        if scheduler_kwargs is None:
+            scheduler_kwargs = {"mode": "min", "factor": 0.9, "patience": 10}
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, **scheduler_kwargs)
+
+        # 5. 初始化 Trainer
+        # 使用自定义的 MemorySamTrainer 来处理 Z 轴/时间轴前向传播
+        trainer = MemorySamTrainer(  # [修改] 使用支持 Memory 的 Trainer
+            name=name,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            model=model,
+            memory_adapter=memory_adapter,  # [新增] 传入 Adapter
+            seq_len=seq_len,  # [新增] 传入序列长度
+            optimizer=optimizer,
+            device=device,
+            lr_scheduler=scheduler,
+            logger=None,  # 若有对应的 MemorySamLogger 可以替换
+            log_image_interval=100,
+            mixed_precision=True,
+            convert_inputs=convert_inputs,
+            n_objects_per_batch=n_objects_per_batch,
+            n_sub_iteration=n_sub_iteration,
+            compile_model=False,
+            early_stopping=early_stopping,
+            mask_prob=mask_prob,
+            save_root=save_root,
+        )
+
+        # 6. 开始训练
+        trainer_fit_params = _get_trainer_fit_params(
+            n_epochs, n_iterations, save_every_kth_epoch, pbar_signals, overwrite_training
+        )
+        trainer.fit(**trainer_fit_params)
+
+        t_run = time.time() - t_start
+        hours = int(t_run // 3600)
+        minutes = int(t_run // 60)
+        seconds = int(round(t_run % 60, 0))
+        print("Memory-augmented Training took", t_run, f"seconds (= {hours:02}:{minutes:02}:{seconds:02} hours)")
 
 
 def export_instance_segmentation_model(

@@ -172,6 +172,17 @@ def point_layer_to_prompts(
         The point coordinates for the prompts.
         The labels (positive or negative / 1 or 0) for the prompts.
     """
+    if "track_id" not in layer.features.columns:
+        layer.features["track_id"] = [1] * len(layer.data)
+    if "state" not in layer.features.columns:
+        layer.features["state"] = ["track"] * len(layer.data)
+
+    current_props = layer.current_properties
+    if "track_id" not in current_props:
+        current_props["track_id"] = np.array([1], dtype=int)
+    if "state" not in current_props:
+        current_props["state"] = np.array(["track"], dtype=str)
+    layer.current_properties = current_props
 
     points = layer.data
     labels = layer.properties["label"]

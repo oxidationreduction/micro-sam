@@ -40,7 +40,7 @@ def finetune_lm_generalist(args):
         n_iterations=args.iterations,
         save_root=args.save_root,
         scheduler_kwargs=scheduler_kwargs,
-        verify_n_labels_in_loader=None,  # Verifies all labels in the loader(s).
+        verify_n_labels_in_loader=10,  # Verifies all labels in the loader(s).
         box_distortion_factor=0.05,
     )
 
@@ -56,23 +56,23 @@ def finetune_lm_generalist(args):
 def main():
     parser = argparse.ArgumentParser(description="Finetune Segment Anything for the LM datasets.")
     parser.add_argument(
-        "--input_path", "-i", default="/mnt/vast-nhr/projects/cidas/cca/experiments/micro_sam/data",
+        "--input_path", "-i", default="/home/mira/Downloads/micro-sam/data/light_microscopy/",
         help="The filepath to all the respective LM datasets. If the data does not exist yet it will be downloaded"
     )
     parser.add_argument(
-        "--model_type", "-m", default="vit_b",
+        "--model_type", "-m", default="vit_l_lm",
         help="The model type to use for fine-tuning. Either 'vit_t', 'vit_b', 'vit_l' or 'vit_h'."
     )
     parser.add_argument(
-        "--save_root", "-s", default="/mnt/vast-nhr/projects/cidas/cca/experiments/micro_sam/v4",
+        "--save_root", "-s", default="/home/mira/Downloads/micro-sam/data/models/",
         help="Where to save the checkpoint and logs. By default they will be saved where this script is run from."
     )
     parser.add_argument(
-        "--iterations", type=int, default=int(25e4),
+        "--iterations", type=int, default=int(1e4),
         help="For how many iterations should the model be trained? By default 250k."
     )
     parser.add_argument(
-        "--export_path", "-e",
+        "--export_path", "-e", default="/home/mira/Downloads/micro-sam/data/models/",
         help="Where to export the finetuned model to. The exported model can be used in the annotation tools."
     )
     parser.add_argument(
