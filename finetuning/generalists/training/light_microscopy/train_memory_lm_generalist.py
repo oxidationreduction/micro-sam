@@ -14,7 +14,7 @@ from obtain_lm_datasets import get_generalist_lm_loaders
 def finetune_lm_generalist_memory(args):
     """Code for finetuning SAM with Memory Adapter on multiple Light Microscopy datasets."""
     # device = "cuda" if torch.cuda.is_available() else "cpu"
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    local_rank = int(os.environ.get("LOCAL_RANK", 2))
 
     # 2. 【最关键的一步】强制当前进程只使用它对应的逻辑 GPU
     torch.cuda.set_device(local_rank)
@@ -44,7 +44,7 @@ def finetune_lm_generalist_memory(args):
     memory_adapter = ZMemoryAdapter(embed_dim=256).to(device)
 
     # 获取数据 loaders
-    train_loader, val_loader = get_generalist_lm_loaders(input_path=args.input_path, patch_shape=patch_shape, batch_size=8)
+    train_loader, val_loader = get_generalist_lm_loaders(input_path=args.input_path, patch_shape=patch_shape, batch_size=6)
     scheduler_kwargs = {"mode": "min", "factor": 0.9, "patience": 5}
 
     # --- 修复核心：直接调用我们封装好的 train_mem_sam 高层接口 ---
@@ -74,7 +74,7 @@ def finetune_lm_generalist_memory(args):
             "" if args.save_root is None else args.save_root, "checkpoints", checkpoint_name, "best.pt"
         )
         export_custom_sam_model(
-            checkpoint_path=best_checkpoint_path, model_type=model_type, save_path=args.export_path
+            checkpoint_path=best_checkpoint_path, model_type=model_type, save_path=os.path.join(args.export_path, "vit_l_lm_mem.pt")
         )
 
 
@@ -89,7 +89,7 @@ def main():
         help="The model type to use for fine-tuning. Either 'vit_t', 'vit_b', 'vit_l' or 'vit_h'."
     )
     parser.add_argument(
-        "--save_root", "-s", default="/home/mira/Downloads/micro-sam/data/models/",
+        "--save_root", "-s", default="/home/mira/Downloads/micro-sam/data/models/tmp",
         help="Where to save the checkpoint and logs. By default they will be saved where this script is run from."
     )
     parser.add_argument(
@@ -97,18 +97,18 @@ def main():
         help="Path to the pre-finetuned micro-sam generalist model (e.g., lm_generalist.pt)"
     )
     parser.add_argument(
-        "--iterations", type=int, default=int(1e3),
-        help="For how many iterations should the model be trained? By default 10k."
+        "--iterations", type=int, default=int(2e3),
+        help="For how many iterations should the model be trained? By default 2k."
     )
     parser.add_argument(
-        "--export_path", "-e", default="/home/mira/Downloads/micro-sam/data/models/",
+        "--export_path", "-e", default="/home/mira/Downloads/micro-sam/data/models/results",
         help="Where to export the finetuned model to. The exported model can be used in the annotation tools."
     )
     parser.add_argument(
         "--n_objects", type=int, default=1, help="The number of instances (objects) per batch used for finetuning."
     )
     parser.add_argument(
-        "--seq_len", type=int, default=64, help="The number of consecutive frames/slices to load for memory tracking."
+        "--seq_len", type=int, default=80, help="The number of consecutive frames/slices to load for memory tracking."
     )
     args = parser.parse_args()
     finetune_lm_generalist_memory(args)

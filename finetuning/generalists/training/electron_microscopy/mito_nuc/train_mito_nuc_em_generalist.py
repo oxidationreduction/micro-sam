@@ -58,7 +58,7 @@ def finetune_mito_nuc_em_generalist(args):
 def main():
     parser = argparse.ArgumentParser(description="Finetune Segment Anything for the Mito. & Nuclei EM datasets.")
     parser.add_argument(
-        "--input_path", "-i", default="/mnt/vast-nhr/projects/cidas/cca/experiments/micro_sam/data",
+        "--input_path", "-i", default="/home/mira/Downloads/micro-sam/data/electron_microscopy",
         help="The filepath to all the respective EM datasets. If the data does not exist yet it will be downloaded"
     )
     parser.add_argument(
@@ -66,7 +66,7 @@ def main():
         help="The model type to use for fine-tuning. Either vit_t, vit_b, vit_l or vit_h."
     )
     parser.add_argument(
-        "--save_root", "-s", default="/mnt/vast-nhr/projects/cidas/cca/experiments/micro_sam/v4",
+        "--save_root", "-s", default="/home/mira/Downloads/micro-sam/data/electron_microscopy",
         help="Where to save the checkpoint and logs. By default they will be saved where this script is run from."
     )
     parser.add_argument(
@@ -74,7 +74,7 @@ def main():
         help="For how many iterations should the model be trained? By default 250k."
     )
     parser.add_argument(
-        "--export_path", "-e",
+        "--export_path", "-e", default="/home/mira/Downloads/micro-sam/data/models",
         help="Where to export the finetuned model to. The exported model can be used in the annotation tools."
     )
     parser.add_argument(

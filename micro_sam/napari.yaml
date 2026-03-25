@@ -41,6 +41,9 @@ contributions:
     - id: micro-sam.annotator_tracking
       python_name: micro_sam.sam_annotator.annotator_tracking:AnnotatorTracking
       title: Start the tracking annotator
+    - id: micro-sam.annotator_memory_3d
+      python_name: micro_sam.sam_annotator.annotator_memory:AnnotatorMemory
+      title: Start the z_memory tracking annotator
     - id: micro-sam.image_series_annotator
       python_name: micro_sam.sam_annotator.image_series_annotator:ImageSeriesAnnotator
       title: Run the annotator for multiple images in a folder
