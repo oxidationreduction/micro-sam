@@ -44,7 +44,7 @@ def finetune_lm_generalist_memory(args):
     memory_adapter = ZMemoryAdapter(embed_dim=256).to(device)
 
     # 获取数据 loaders
-    train_loader, val_loader = get_generalist_lm_loaders(input_path=args.input_path, patch_shape=patch_shape, batch_size=6)
+    train_loader, val_loader = get_generalist_lm_loaders(input_path=args.input_path, patch_shape=patch_shape, batch_size=9)
     scheduler_kwargs = {"mode": "min", "factor": 0.9, "patience": 5}
 
     # --- 修复核心：直接调用我们封装好的 train_mem_sam 高层接口 ---
@@ -108,7 +108,7 @@ def main():
         "--n_objects", type=int, default=1, help="The number of instances (objects) per batch used for finetuning."
     )
     parser.add_argument(
-        "--seq_len", type=int, default=80, help="The number of consecutive frames/slices to load for memory tracking."
+        "--seq_len", type=int, default=64, help="The number of consecutive frames/slices to load for memory tracking."
     )
     args = parser.parse_args()
     finetune_lm_generalist_memory(args)

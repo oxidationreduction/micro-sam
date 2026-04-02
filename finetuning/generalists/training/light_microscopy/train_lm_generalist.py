@@ -2,6 +2,7 @@ import os
 import argparse
 
 import torch
+import torch.distributed as dist
 
 import micro_sam.training as sam_training
 from micro_sam.util import export_custom_sam_model
@@ -12,7 +13,19 @@ from obtain_lm_datasets import get_generalist_lm_loaders
 def finetune_lm_generalist(args):
     """Code for finetuning SAM on multiple Light Microscopy datasets."""
     # override this (below) if you have some more complex set-up and need to specify the exact gpu
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    # device = "cuda" if torch.cuda.is_available() else "cpu"
+    local_rank = int(os.environ.get("LOCAL_RANK", 2))
+
+    # 2. 【最关键的一步】强制当前进程只使用它对应的逻辑 GPU
+    torch.cuda.set_device(local_rank)
+
+    # 3. 定义 device 变量，后续模型和数据都 .to(device)
+    device = torch.device(f"cuda:{local_rank}")
+
+    # 4. 初始化分布式进程组 (如果是真正的 DDP 训练，必须有这一步)
+    if "LOCAL_RANK" in os.environ:
+        dist.init_process_group(backend="nccl")
+        print(f"[Process {local_rank}] Use GPU: {torch.cuda.current_device()}")
 
     # training settings:
     model_type = args.model_type
@@ -22,7 +35,7 @@ def finetune_lm_generalist(args):
     checkpoint_name = f"{(model_type)}/lm_generalist_sam"
 
     # all the stuff we need for training
-    train_loader, val_loader = get_generalist_lm_loaders(input_path=args.input_path, patch_shape=patch_shape)
+    train_loader, val_loader = get_generalist_lm_loaders(input_path=args.input_path, patch_shape=patch_shape, batch_size=4)
     scheduler_kwargs = {"mode": "min", "factor": 0.9, "patience": 5}
 
     # Run training.
@@ -68,7 +81,7 @@ def main():
         help="Where to save the checkpoint and logs. By default they will be saved where this script is run from."
     )
     parser.add_argument(
-        "--iterations", type=int, default=int(1e4),
+        "--iterations", type=int, default=int(2e3),
         help="For how many iterations should the model be trained? By default 250k."
     )
     parser.add_argument(
@@ -76,7 +89,7 @@ def main():
         help="Where to export the finetuned model to. The exported model can be used in the annotation tools."
     )
     parser.add_argument(
-        "--n_objects", type=int, default=25, help="The number of instances (objects) per batch used for finetuning."
+        "--n_objects", type=int, default=1, help="The number of instances (objects) per batch used for finetuning."
     )
     args = parser.parse_args()
     finetune_lm_generalist(args)

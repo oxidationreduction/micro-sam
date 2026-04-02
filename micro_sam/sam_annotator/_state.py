@@ -83,7 +83,7 @@ class AnnotatorState(metaclass=Singleton):
     # For image_series_object_classifier
     previous_features: Optional[np.ndarray] = None
     previous_labels: Optional[np.ndarray] = None
-    # memory_adapter: Optional[nn.Module] = None
+    memory_adapter: Optional[nn.Module] = None
 
     def initialize_predictor(
         self,

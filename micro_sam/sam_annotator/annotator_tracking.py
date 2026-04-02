@@ -335,12 +335,14 @@ def annotator_tracking(
     )
     state.image_shape = image.shape[:-1] if image.ndim == 4 else image.shape
 
+    print(state.image_shape)
     if viewer is None:
         viewer = napari.Viewer()
 
     viewer.add_image(image, name="image")
     annotator = AnnotatorTracking(viewer, reset_state=False)
 
+    print("Update image.")
     # Trigger layer update of the annotator so that layers have the correct shape.
     annotator._update_image()
 

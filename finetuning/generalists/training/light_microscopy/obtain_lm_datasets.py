@@ -65,8 +65,8 @@ def get_concat_lm_datasets(input_path, patch_shape, split_choice):
         label_transform = PerObjectDistanceTransform(
             distances=True, boundary_distances=True, directed_distances=False, foreground=True, instances=True,
         )
-        # return label_transform
-        return None
+        return label_transform
+        # return None
 
     def get_livecell_datasets():
         "Datasets for cell segmentation in phase contrast microscopy images."

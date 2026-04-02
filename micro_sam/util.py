@@ -1,7 +1,7 @@
 """
 Helper functions for downloading Segment Anything models and predicting image embeddings.
 """
-
+import glob
 import os
 import multiprocessing as mp
 import pickle
@@ -275,7 +275,7 @@ def _load_checkpoint(checkpoint_path):
     custom_pickle = pickle
     custom_pickle.Unpickler = _CustomUnpickler
 
-    state = torch.load(checkpoint_path, map_location="cpu", pickle_module=custom_pickle)
+    state = torch.load(checkpoint_path, map_location="cuda", pickle_module=custom_pickle)
     if "model_state" in state:
         # Copy the model weights from torch_em's training format.
         model_state = state["model_state"]
@@ -290,6 +290,7 @@ def _load_checkpoint(checkpoint_path):
 
 
 def _download_sam_model(model_type, progress_bar_factory=None):
+    print(f"Model type: {model_type}")
     model_registry = models()
 
     progress_bar = True
@@ -1321,15 +1322,22 @@ def load_image_data(path: str, key: Optional[str] = None, lazy_loading: bool = F
     Returns:
         The image data.
     """
-    if key is None:
-        image_data = imageio.imread(path)
-    else:
-        with open_file(path, mode="r") as f:
-            image_data = f[key]
-            if not lazy_loading:
-                image_data = image_data[:]
+    images_files = sorted(glob.glob(f"{path}/*"))[:20] if os.path.isdir(path) else [path]
+    images_data = []
+    for images_file in images_files:
+        if key is None:
+            images_data.append(imageio.imread(images_file))
+        else:
+            with open_file(path, mode="r") as f:
+                image_data = f[key]
+                if not lazy_loading:
+                    image_data = image_data[:]
+                images_data.append(image_data)
+    images_data = np.array(images_data[:20])
+    if not os.path.isdir(path):
+        images_data = images_data[0]
 
-    return image_data
+    return images_data
 
 
 def segmentation_to_one_hot(segmentation: np.ndarray, segmentation_ids: Optional[np.ndarray] = None) -> torch.Tensor:

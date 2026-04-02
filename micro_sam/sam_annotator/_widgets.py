@@ -1550,19 +1550,19 @@ class SegmentNDWidget(_WidgetBase):
 
     def _run_tracking(self):
         state = AnnotatorState()
-        if not hasattr(state, "memory_adapter") or state.memory_adapter is None:
-            print("初始化 ZMemoryAdapter...")
-            # 假设你的特征维度是 256 (SAM 的默认值)
-            state.memory_adapter = ZMemoryAdapter(embed_dim=256).to("cuda")
-
-            # 如果你未来微调训练好了模型，在这里加载权重：
-            # weight_path = "/path/to/your/trained_adapter.pth"
-            # if os.path.exists(weight_path):
-            #     state.memory_adapter.load_state_dict(torch.load(weight_path))
-            #     print("成功加载 ZMemoryAdapter 权重！")
-
-            # 必须设置为评估模式，否则 batchnorm/dropout 会捣乱
-            state.memory_adapter.eval()
+        # if not hasattr(state, "memory_adapter") or state.memory_adapter is None:
+        #     print("初始化 ZMemoryAdapter...")
+        #     # 假设你的特征维度是 256 (SAM 的默认值)
+        #     state.memory_adapter = ZMemoryAdapter(embed_dim=256).to("cuda")
+        #
+        #     # 如果你未来微调训练好了模型，在这里加载权重：
+        #     # weight_path = "/path/to/your/trained_adapter.pth"
+        #     # if os.path.exists(weight_path):
+        #     #     state.memory_adapter.load_state_dict(torch.load(weight_path))
+        #     #     print("成功加载 ZMemoryAdapter 权重！")
+        #
+        #     # 必须设置为评估模式，否则 batchnorm/dropout 会捣乱
+        #     state.memory_adapter.eval()
         pbar, pbar_signals = _create_pbar_for_threadworker()
 
         # @thread_worker

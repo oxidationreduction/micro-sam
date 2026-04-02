@@ -422,9 +422,9 @@ def train_mem_sam(
         t_start = time.time()
 
         # 注意：此处需要确保 train_loader 吐出的是 [B, seq_len, C, H, W] 的 3D 数据
-        if verify_n_labels_in_loader is not None:
-            _check_loader(train_loader, False, "train", verify_n_labels_in_loader)
-            _check_loader(val_loader, False, "val", verify_n_labels_in_loader)
+        # if verify_n_labels_in_loader is not None:
+        #     _check_loader(train_loader, False, "train", verify_n_labels_in_loader)
+        #     _check_loader(val_loader, False, "val", verify_n_labels_in_loader)
 
         device = get_device(device)
 

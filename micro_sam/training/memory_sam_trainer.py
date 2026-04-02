@@ -1,5 +1,12 @@
 import torch
 import torch.nn as nn
+from torch import overrides
+from torch_em.trainer.wandb_logger import WandbLogger
+from tqdm import tqdm
+import time
+import os
+from typing import Union, Optional
+
 from micro_sam.training.sam_trainer import SamTrainer
 
 class MemorySamTrainer(SamTrainer):
@@ -263,3 +270,134 @@ class MemorySamTrainer(SamTrainer):
             y_one_hot_t0,
             metric
         )
+
+    def fit(
+        self,
+        iterations: Optional[int] = None,
+        load_from_checkpoint: Optional[Union[os.PathLike, str]] = None,
+        epochs: Optional[int] = None,
+        save_every_kth_epoch: Optional[int] = None,
+        progress=None,
+        overwrite_training: bool = True,
+    ):
+        """Run neural network training.
+
+        Exactly one of 'iterations' or 'epochs' has to be passed.
+
+        Args:
+            iterations: How long to train, specified in iterations.
+            load_from_checkpoint: Path to a checkpoint from where training should be continued .
+            epochs: How long to train, specified in epochs.
+            save_every_kth_epoch: Save checkpoints after every kth epoch in a separate file.
+                The corresponding checkpoints will be saved with the naming scheme 'epoch-{epoch}.pt'.
+            progress: Optional progress bar for integration with external tools. Expected to follow the tqdm interface.
+            overwrite_training: Whether to overwrite existing checkpoints in the save directory.
+        """
+        print("######################")
+        print("# Training MemorySam #")
+        print("######################")
+        best_metric = self._initialize(iterations, load_from_checkpoint, epochs)
+
+        if not overwrite_training:
+            if load_from_checkpoint is not None:
+                raise ValueError(
+                    "We do not support 'overwrite_training=False' and 'load_from_checkpoint' at the same time."
+                )
+
+            if self._verify_if_training_completed():
+                print(
+                    f"The model is trained for {self.max_iteration} iterations / {self.max_epoch} epochs "
+                    "and 'overwrite_training' is set to 'False'."
+                )
+                print(f"The checkpoints are located at '{os.path.abspath(self.checkpoint_folder)}'.")
+                return
+
+        print(
+            "Start fitting for",
+            self.max_iteration - self._iteration,
+            "iterations / ",
+            self.max_epoch - self._epoch,
+            "epochs",
+        )
+        print("with", len(self.train_loader), "iterations per epoch")
+
+        if self.mixed_precision:
+            train_epoch = self._train_epoch_mixed
+            validate = self._validate_mixed
+            print("Training with mixed precision")
+        else:
+            train_epoch = self._train_epoch
+            validate = self._validate
+            print("Training with single precision")
+
+        total_iterations = epochs * len(self.train_loader) if iterations is None else iterations
+        if progress is None:
+            progress = tqdm(total=total_iterations, desc=f"Epoch {self._epoch}", leave=True)
+        else:
+            progress.total = total_iterations
+            progress.set_description(f"Epoch {self._epoch}")
+
+        msg = "Epoch %i: average [s/it]: %f, current metric: %f, best metric: %f"
+        train_epochs = self.max_epoch - self._epoch
+        t_start = time.time()
+        for epoch in range(train_epochs):
+
+            # Ensure data is shuffled differently at each epoch.
+            try:
+                self.train_loader.sampler.set_epoch(epoch)
+            except AttributeError:
+                pass
+
+            # Run training and validation for this epoch
+            t_per_iter = train_epoch(progress)
+            current_metric = validate()
+
+            # perform all the post-epoch steps:
+
+            # apply the learning rate scheduler
+            if self.lr_scheduler is not None:
+                self.lr_scheduler.step(current_metric)
+
+            # how long did we train in total?
+            total_train_time = (time.time() - t_start) + self.train_time
+
+            # save this checkpoint as the new best checkpoint if
+            # it has the best overall validation metric
+            if current_metric < best_metric:
+                best_metric = current_metric
+                self._best_epoch = self._epoch
+                self.save_checkpoint("best", current_metric, best_metric, train_time=total_train_time)
+                torch.save(self.memory_adapter, os.path.join(self.checkpoint_folder, "best_mem_adapter.pt"))
+
+            # save this checkpoint as the latest checkpoint
+            self.save_checkpoint("latest", current_metric, best_metric, train_time=total_train_time)
+            torch.save(self.memory_adapter, os.path.join(self.checkpoint_folder, "latest_mem_adapter.pt"))
+
+            # if we save after every k-th epoch then check if we need to save now
+            if save_every_kth_epoch is not None and (self._epoch + 1) % save_every_kth_epoch == 0:
+                self.save_checkpoint(
+                    f"epoch-{self._epoch + 1}", current_metric, best_metric, train_time=total_train_time
+                )
+
+            # if early stopping has been specified then check if the stopping condition is met
+            if self.early_stopping is not None:
+                epochs_since_best = self._epoch - self._best_epoch
+                if epochs_since_best > self.early_stopping:
+                    print("Stopping training because there has been no improvement for", self.early_stopping, "epochs")
+                    break
+
+            self._epoch += 1
+            progress.set_description(msg % (self._epoch, t_per_iter, current_metric, best_metric), refresh=True)
+
+        print(f"Finished training after {self._epoch} epochs / {self._iteration} iterations.")
+        print(f"The best epoch is number {self._best_epoch}.")
+
+        if self._generate_name:
+            self.name = None
+
+        # Update the train time
+        self.train_time = total_train_time
+
+        # TODO save the model to wandb if we have the wandb logger
+        if isinstance(self.logger, WandbLogger):
+            self.logger.get_wandb().finish()

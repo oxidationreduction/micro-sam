@@ -1,6 +1,8 @@
-from typing import Optional, Tuple, Union
+import sys
 
 import napari
+from typing import Optional, Tuple, Union
+
 import numpy as np
 
 import torch
@@ -28,6 +30,7 @@ class AnnotatorMemory(_AnnotatorBase):
             state.reset_state()
 
         state.annotator = self
+        print("Memory Annotator")
 
     def _get_widgets(self):
         autosegment = widgets.AutoSegmentWidget(
@@ -194,10 +197,14 @@ def annotator_memory_3d(
     # 初始化状态
     state = AnnotatorState()
     state.image_shape = image.shape[:-1] if image.ndim == 4 else image.shape
+    print("State inited")
 
     # 创建 3D viewer
+    print(image.shape)
+    sys.argv = [sys.argv[0]]
     if viewer is None:
         viewer = napari.Viewer()
+    print("Viewer created")
     viewer.add_image(image, name="image")
 
     # 实例化我们的专属追踪插件
@@ -256,22 +263,16 @@ def annotator_memory_3d(
 
 def main():
     """@private"""
-    parser = _initialize_parser(description="Run Memory Tracking Segmentation for an image volume.")
-    args = parser.parse_args()
-
-    # 加载 3D 图像
-    image = util.load_image_data(args.input, key=args.key)
-
-    if args.segmentation_result is None:
-        segmentation_result = None
-    else:
-        segmentation_result = util.load_image_data(args.segmentation_result, key=args.segmentation_key)
+    input = "/mnt/mira_datacenter/liuhongyu2024/ninanjie/3_cell/raw_0/"
+    model_type = "vit_l"
+    checkpoint = "/home/mira/Downloads/micro-sam/data/models/checkpoints/vit_l_lm/lm_generalist_memory_sam/best.pt"
+    image = util.load_image_data(input, key=None)
 
     annotator_memory_3d(
-        image, embedding_path=args.embedding_path,
-        segmentation_result=segmentation_result,
-        model_type=args.model_type, tile_shape=args.tile_shape, halo=args.halo,
-        checkpoint_path=args.checkpoint,
+        image, embedding_path=None,
+        segmentation_result=None,
+        model_type=model_type, tile_shape=None, halo=None,
+        checkpoint_path=checkpoint,
     )
 
 

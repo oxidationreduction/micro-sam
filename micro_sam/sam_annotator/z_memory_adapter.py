@@ -60,9 +60,6 @@ class ZMemoryAdapter(nn.Module):
         参数:
         image_embeddings: [B, 256, 64, 64]
         """
-        batch_size = image_embeddings.shape[0]
-        device = image_embeddings.device
-        embed_dim = image_embeddings.shape[1]
 
         # 理论上 t>0 时 memory_state 不会为空，防御性判定
         if memory_state is None:
@@ -95,7 +92,6 @@ class ZMemoryAdapter(nn.Module):
         # 5. 生成空的 Sparse Prompt
         # 因为我们的记忆全部通过 Dense 稠密空间特征传递，不需要点/框提示
         # SAM 要求 sparse_embeddings 的形状为 [B, N, 256]，我们传 N=0
-        dense_embeddings = self.up_proj(aligned_feat) * self.gamma
         sparse_embeddings = torch.empty(image_embeddings.shape[0], 0, 256, device=image_embeddings.device)
 
         return sparse_embeddings, dense_embeddings
