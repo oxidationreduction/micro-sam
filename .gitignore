@@ -197,6 +197,7 @@ iterative_prompting_results/
 *MACOSX
 hela_ctc
 clf-test-data
+livecell_coco_train.json
 
 # Related to i2k workshop folders.
 data/
