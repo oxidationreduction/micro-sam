@@ -398,3 +398,43 @@ class RealSequenceTifDataset(Dataset):
         ]
         label_tensor = np.stack(transformed, axis=0)
         return torch.from_numpy(label_tensor)
+
+
+class SequenceWindowToFrameDataset(Dataset):
+    """Flatten sequence windows into independent 2D samples.
+
+    This wrapper is used for plain-SAM baselines that should consume the same
+    real tif sequence windows as the memory-adapter training, but without any
+    temporal conditioning.
+    """
+
+    def __init__(
+        self,
+        sequence_dataset: RealSequenceTifDataset,
+        frame_indices: Sequence[int] | None = None,
+    ) -> None:
+        self.sequence_dataset = sequence_dataset
+        if frame_indices is None:
+            frame_indices = tuple(range(sequence_dataset.seq_len))
+        else:
+            frame_indices = tuple(int(index) for index in frame_indices)
+            if not frame_indices:
+                raise ValueError("Expected at least one frame index for flattening sequence windows.")
+
+        invalid_indices = [index for index in frame_indices if index < 0 or index >= sequence_dataset.seq_len]
+        if invalid_indices:
+            raise ValueError(
+                f"Frame indices {invalid_indices} are out of bounds for seq_len={sequence_dataset.seq_len}"
+            )
+
+        self.frame_indices = frame_indices
+
+    def __len__(self) -> int:
+        return len(self.sequence_dataset) * len(self.frame_indices)
+
+    def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        num_frames = len(self.frame_indices)
+        window_index, frame_offset = divmod(index, num_frames)
+        sequence_images, sequence_labels = self.sequence_dataset[window_index]
+        frame_index = self.frame_indices[frame_offset]
+        return sequence_images[frame_index], sequence_labels[frame_index]

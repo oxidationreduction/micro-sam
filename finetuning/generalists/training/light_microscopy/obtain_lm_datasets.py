@@ -12,7 +12,10 @@ from torch_em.data import MinInstanceSampler, ConcatDataset
 from torch_em.transform.label import PerObjectDistanceTransform
 from torch_em.data.datasets.light_microscopy.neurips_cell_seg import to_rgb
 
-from finetuning.generalists.training.light_microscopy.real_sequence_loader import RealSequenceTifDataset
+from finetuning.generalists.training.light_microscopy.real_sequence_loader import (
+    RealSequenceTifDataset,
+    SequenceWindowToFrameDataset,
+)
 from finetuning.generalists.training.light_microscopy.seq_wrapper import SyntheticSequenceWrapper
 from micro_sam.training.util import ResizeRawTrafo, ResizeLabelTrafo
 
@@ -314,6 +317,76 @@ def get_real_sequence_lm_loaders(
     ]
     val_datasets = [
         RealSequenceTifDataset(dataset_root=root, split="val", **dataset_kwargs)
+        for root in dataset_roots
+    ]
+
+    train_dataset = train_datasets[0] if len(train_datasets) == 1 else ConcatDataset(*train_datasets)
+    val_dataset = val_datasets[0] if len(val_datasets) == 1 else ConcatDataset(*val_datasets)
+
+    train_loader = torch_em.get_data_loader(
+        train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers
+    )
+    val_loader = torch_em.get_data_loader(
+        val_dataset, batch_size=max(1, batch_size >> 1), shuffle=False, num_workers=num_workers
+    )
+    return train_loader, val_loader
+
+
+def get_real_sequence_frame_lm_loaders(
+    dataset_root,
+    patch_shape,
+    batch_size=4,
+    num_workers=0,
+    val_fraction=0.2,
+    min_size=10,
+    min_tracking_length=4,
+    seed=17,
+    label_mode="auto",
+    require_consecutive_slices=True,
+    require_full_track=True,
+    frame_indices=None,
+):
+    """Build 2D loaders from the same real tif sequence windows used by memory training.
+
+    The underlying sequence windows are identical to `get_real_sequence_lm_loaders`, but each
+    sampled window is flattened into independent 2D frames so that plain-SAM finetuning can use
+    the same data source without temporal prompts.
+    """
+    if len(patch_shape) != 3:
+        raise ValueError(f"Expected patch_shape=(seq_len, H, W), got {patch_shape}")
+
+    seq_len, patch_h, patch_w = patch_shape
+    dataset_kwargs = {
+        "seq_len": seq_len,
+        "patch_shape": (patch_h, patch_w),
+        "val_fraction": val_fraction,
+        "min_size": min_size,
+        "min_tracking_length": min_tracking_length,
+        "seed": seed,
+        "label_mode": label_mode,
+        "require_consecutive_slices": require_consecutive_slices,
+        "require_full_track": require_full_track,
+    }
+
+    if isinstance(dataset_root, (list, tuple)):
+        dataset_roots = [str(root) for root in dataset_root if str(root).strip()]
+    else:
+        dataset_roots = [root.strip() for root in str(dataset_root).split(",") if root.strip()]
+    if not dataset_roots:
+        raise ValueError("Expected at least one sequence dataset root.")
+
+    train_datasets = [
+        SequenceWindowToFrameDataset(
+            RealSequenceTifDataset(dataset_root=root, split="train", **dataset_kwargs),
+            frame_indices=frame_indices,
+        )
+        for root in dataset_roots
+    ]
+    val_datasets = [
+        SequenceWindowToFrameDataset(
+            RealSequenceTifDataset(dataset_root=root, split="val", **dataset_kwargs),
+            frame_indices=frame_indices,
+        )
         for root in dataset_roots
     ]
 
