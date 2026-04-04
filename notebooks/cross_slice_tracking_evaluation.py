@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import pickle
 from collections import OrderedDict
 from typing import Dict, List, Optional, Tuple
 
@@ -33,7 +34,7 @@ import numpy as np
 import torch
 
 from micro_sam import util as sam_util
-from micro_sam.sam_annotator.z_memory_adapter import ZMemoryAdapter
+from micro_sam.sam_annotator.z_memory_adapter import ZMemoryAdapter, get_module_device
 
 
 # %%
@@ -73,7 +74,18 @@ def _load_checkpoint_state_dict(
     2. 直接保存的 state_dict
     3. torch.save(module) 直接保存的 nn.Module
     """
-    checkpoint = torch.load(checkpoint_path, map_location=map_location)
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location=map_location)
+    except pickle.UnpicklingError as err:
+        # PyTorch 2.6 defaults to weights_only=True. Retry with weights_only=False
+        # for trusted training checkpoints that contain custom classes.
+        if "Weights only load failed" not in str(err):
+            raise
+        checkpoint = torch.load(
+            checkpoint_path,
+            map_location=map_location,
+            weights_only=False,
+        )
 
     if isinstance(checkpoint, torch.nn.Module):
         return OrderedDict(checkpoint.state_dict())
@@ -155,8 +167,9 @@ def load_sam_with_memory_adapter(
         checkpoint_path=base_sam_checkpoint_path,
     )
     sam_model = predictor.model
+    model_device = get_module_device(sam_model)
 
-    memory_adapter = ZMemoryAdapter(embed_dim=embed_dim).to(sam_model.device)
+    memory_adapter = ZMemoryAdapter(embed_dim=embed_dim).to(model_device)
     sam_model.memory_adapter = memory_adapter
 
     load_report: Dict[str, List[str]] = {
@@ -169,7 +182,7 @@ def load_sam_with_memory_adapter(
     if finetuned_checkpoint_path:
         finetuned_state = _load_checkpoint_state_dict(
             finetuned_checkpoint_path,
-            map_location=sam_model.device,
+            map_location=model_device,
         )
         normalized_state = _prepare_sam_state_dict(finetuned_state)
         sam_state = _remove_adapter_keys_from_state_dict(normalized_state)
@@ -192,7 +205,7 @@ def load_sam_with_memory_adapter(
     if adapter_checkpoint_path:
         adapter_raw_state = _load_checkpoint_state_dict(
             adapter_checkpoint_path,
-            map_location=sam_model.device,
+            map_location=model_device,
         )
         adapter_state = _extract_adapter_state_dict(adapter_raw_state)
         if not adapter_state:
@@ -210,6 +223,45 @@ def load_sam_with_memory_adapter(
     sam_model.eval()
     sam_model.memory_adapter.eval()
 
+    return sam_model, predictor, load_report
+
+
+# %%
+def load_plain_sam(
+    model_type: str = "vit_b",
+    device: Optional[str] = None,
+    base_sam_checkpoint_path: Optional[str] = None,
+    finetuned_checkpoint_path: Optional[str] = "best.pt",
+) -> Tuple[torch.nn.Module, object, Dict[str, List[str]]]:
+    """Load a plain SAM model without injecting a memory adapter."""
+    predictor = sam_util.get_sam_model(
+        model_type=model_type,
+        device=device,
+        checkpoint_path=base_sam_checkpoint_path,
+    )
+    sam_model = predictor.model
+    model_device = get_module_device(sam_model)
+
+    load_report: Dict[str, List[str]] = {
+        "sam_missing_keys": [],
+        "sam_unexpected_keys": [],
+        "adapter_missing_keys": [],
+        "adapter_unexpected_keys": [],
+    }
+
+    if finetuned_checkpoint_path:
+        finetuned_state = _load_checkpoint_state_dict(
+            finetuned_checkpoint_path,
+            map_location=model_device,
+        )
+        normalized_state = _prepare_sam_state_dict(finetuned_state)
+        sam_state = _remove_adapter_keys_from_state_dict(normalized_state)
+
+        sam_missing, sam_unexpected = sam_model.load_state_dict(sam_state, strict=False)
+        load_report["sam_missing_keys"] = list(sam_missing)
+        load_report["sam_unexpected_keys"] = list(sam_unexpected)
+
+    sam_model.eval()
     return sam_model, predictor, load_report
 
 
@@ -344,6 +396,58 @@ def predict_slice_from_memory(
     return pred_mask, current_embed
 
 
+def get_mask_bounding_box(mask: np.ndarray, padding: int = 8) -> np.ndarray:
+    """Compute an XYXY prompt box from a binary mask."""
+    coords = np.argwhere(mask > 0)
+    if len(coords) == 0:
+        raise ValueError("当前 mask 为空，无法生成 box prompt。")
+
+    y_min, x_min = coords.min(axis=0)
+    y_max, x_max = coords.max(axis=0)
+    height, width = mask.shape
+
+    x0 = max(0, int(x_min) - padding)
+    y0 = max(0, int(y_min) - padding)
+    x1 = min(width - 1, int(x_max) + padding)
+    y1 = min(height - 1, int(y_max) + padding)
+    return np.array([x0, y0, x1, y1], dtype=np.float32)
+
+
+@torch.no_grad()
+def predict_slice_from_previous_mask(
+    predictor,
+    image_slice: np.ndarray,
+    previous_mask: np.ndarray,
+    box_padding: int = 8,
+    use_box_prompt: bool = True,
+    use_point_prompt: bool = True,
+) -> Tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
+    """
+    Predict the next slice from the previous predicted mask using standard SAM prompts.
+
+    The previous mask is converted into a box prompt and/or a positive point prompt.
+    """
+    if not previous_mask.any():
+        empty_mask = np.zeros_like(previous_mask, dtype=bool)
+        return empty_mask, None, None
+
+    predictor.set_image(normalize_slice_to_rgb(image_slice))
+
+    point_coords = get_mask_center_point(previous_mask) if use_point_prompt else None
+    point_labels = np.array([1], dtype=np.int32) if use_point_prompt else None
+    box = get_mask_bounding_box(previous_mask, padding=box_padding) if use_box_prompt else None
+
+    masks, _, _ = predictor.predict(
+        point_coords=point_coords,
+        point_labels=point_labels,
+        box=box,
+        multimask_output=False,
+        return_logits=False,
+    )
+    pred_mask = masks[0].astype(bool)
+    return pred_mask, point_coords, box
+
+
 # %%
 @torch.no_grad()
 def evaluate_cross_slice_tracking(
@@ -381,10 +485,11 @@ def evaluate_cross_slice_tracking(
 
     pred_volume = np.zeros_like(gt_volume, dtype=np.uint8)
     iou_per_slice: List[float] = []
+    model_device = get_module_device(sam_model)
 
     memory_state = sam_model.memory_adapter.init_memory(
         batch_size=1,
-        device=sam_model.device,
+        device=model_device,
     )
 
     # Z = 0: GT 中心点初始化
@@ -396,7 +501,7 @@ def evaluate_cross_slice_tracking(
     pred_volume[0] = first_pred_mask.astype(np.uint8)
     iou_per_slice.append(compute_iou(first_pred_mask, gt_volume[0]))
 
-    first_mask_tensor = mask_to_tensor(first_pred_mask, sam_model.device)
+    first_mask_tensor = mask_to_tensor(first_pred_mask, model_device)
     memory_state = sam_model.memory_adapter.update_memory(
         memory_state=memory_state,
         current_image_embeddings=current_embed,
@@ -416,12 +521,79 @@ def evaluate_cross_slice_tracking(
         pred_volume[z] = pred_mask.astype(np.uint8)
         iou_per_slice.append(compute_iou(pred_mask, gt_volume[z]))
 
-        current_mask_tensor = mask_to_tensor(pred_mask, sam_model.device)
+        current_mask_tensor = mask_to_tensor(pred_mask, model_device)
         memory_state = sam_model.memory_adapter.update_memory(
             memory_state=memory_state,
             current_image_embeddings=current_embed,
             current_mask=current_mask_tensor,
         )
+
+    return {
+        "pred_volume": pred_volume,
+        "iou_per_slice": iou_per_slice,
+        "init_point": init_point,
+    }
+
+
+@torch.no_grad()
+def evaluate_cross_slice_tracking_without_memory(
+    predictor,
+    image_volume: np.ndarray,
+    gt_volume: np.ndarray,
+    box_padding: int = 8,
+    use_box_prompt: bool = True,
+    use_point_prompt: bool = True,
+    reuse_last_non_empty_mask: bool = True,
+) -> Dict[str, object]:
+    """
+    Evaluate recursive cross-slice tracking with plain SAM prompts and no memory adapter.
+
+    The first slice is initialized from the GT center point. Each later slice reuses the
+    previous non-empty prediction as a box and/or point prompt.
+    """
+    if image_volume.ndim != 3 or gt_volume.ndim != 3:
+        raise ValueError(
+            f"image_volume 和 gt_volume 都必须是 [Z, H, W]。"
+            f"当前形状分别为 {image_volume.shape} 和 {gt_volume.shape}"
+        )
+    if image_volume.shape != gt_volume.shape:
+        raise ValueError(
+            f"image_volume 与 gt_volume 的形状不一致: "
+            f"{image_volume.shape} vs {gt_volume.shape}"
+        )
+
+    gt_volume = (gt_volume > 0).astype(np.uint8)
+    z_slices = image_volume.shape[0]
+
+    pred_volume = np.zeros_like(gt_volume, dtype=np.uint8)
+    iou_per_slice: List[float] = []
+
+    first_pred_mask, init_point, _ = predict_first_slice_with_gt_point(
+        predictor=predictor,
+        gt_slice=gt_volume[0],
+        image_slice=image_volume[0],
+    )
+    pred_volume[0] = first_pred_mask.astype(np.uint8)
+    iou_per_slice.append(compute_iou(first_pred_mask, gt_volume[0]))
+
+    last_prompt_mask = first_pred_mask.copy()
+
+    for z in range(1, z_slices):
+        prompt_mask = last_prompt_mask if reuse_last_non_empty_mask else pred_volume[z - 1].astype(bool)
+        pred_mask, _, _ = predict_slice_from_previous_mask(
+            predictor=predictor,
+            image_slice=image_volume[z],
+            previous_mask=prompt_mask,
+            box_padding=box_padding,
+            use_box_prompt=use_box_prompt,
+            use_point_prompt=use_point_prompt,
+        )
+
+        pred_volume[z] = pred_mask.astype(np.uint8)
+        iou_per_slice.append(compute_iou(pred_mask, gt_volume[z]))
+
+        if pred_mask.any():
+            last_prompt_mask = pred_mask.copy()
 
     return {
         "pred_volume": pred_volume,

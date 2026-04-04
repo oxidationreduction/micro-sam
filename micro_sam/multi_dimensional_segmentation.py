@@ -20,7 +20,7 @@ from elf.tracking.motile_tracking import recolor_segmentation
 
 from segment_anything.predictor import SamPredictor
 
-from .sam_annotator.util import get_embedding_tensor
+from .sam_annotator.z_memory_adapter import get_module_device, mask_to_memory_tensor, predict_from_memory_state
 
 try:
     from napari.utils import progress as tqdm
@@ -101,7 +101,7 @@ def _advanced_stopping_criteria(
     return criterion
 
 
-def segment_mask_in_volume(
+def _segment_mask_in_volume_legacy(
     segmentation: np.ndarray,
     predictor: SamPredictor,
     image_embeddings: util.ImageEmbeddings,
@@ -136,6 +136,20 @@ def segment_mask_in_volume(
         Array with the volumetric segmentation.
         Tuple with the first and last segmented slice.
     """
+    return segment_mask_in_volume(
+        segmentation=segmentation,
+        predictor=predictor,
+        image_embeddings=image_embeddings,
+        segmented_slices=segmented_slices,
+        stop_lower=stop_lower,
+        stop_upper=stop_upper,
+        iou_threshold=iou_threshold,
+        projection=projection,
+        update_progress=update_progress,
+        box_extension=box_extension,
+        verbose=verbose,
+        memory_adapter=memory_adapter,
+    )
     # 验证projection模式，确定使用哪些prompt类型（mask, box, points等）
     # 这决定了如何从上一层的分割结果生成prompt传递给SAM
     use_box, use_mask, use_points, use_single_point = _validate_projection(projection)
@@ -276,6 +290,142 @@ def segment_mask_in_volume(
                     update_progress(1)
 
     # 返回更新后的segmentation和扩展后的范围(z_min, z_max)
+    return segmentation, (z_min, z_max)
+
+
+def segment_mask_in_volume(
+    segmentation: np.ndarray,
+    predictor: SamPredictor,
+    image_embeddings: util.ImageEmbeddings,
+    segmented_slices: np.ndarray,
+    stop_lower: bool,
+    stop_upper: bool,
+    iou_threshold: float,
+    projection: Union[str, dict],
+    update_progress: Optional[callable] = None,
+    box_extension: float = 0.0,
+    verbose: bool = False,
+    memory_adapter=None
+) -> Tuple[np.ndarray, Tuple[int, int]]:
+    use_box, use_mask, use_points, use_single_point = _validate_projection(projection)
+
+    if update_progress is None:
+        def update_progress(*args):
+            pass
+
+    model_device = get_module_device(predictor.model)
+    if memory_adapter is not None:
+        predictor.model.memory_adapter = memory_adapter
+
+    def _init_memory_state(z_index: int):
+        if memory_adapter is None:
+            return None
+
+        memory_state = memory_adapter.init_memory(batch_size=1, device=model_device)
+        util.set_precomputed(predictor, image_embeddings, z_index)
+        return memory_adapter.update_memory(
+            memory_state=memory_state,
+            current_image_embeddings=predictor.features,
+            current_mask=mask_to_memory_tensor(segmentation[z_index], model_device),
+        )
+
+    def segment_range(z_start, z_stop, increment, stopping_criterion, threshold=None, verbose=False):
+        z = z_start + increment
+        memory_state = _init_memory_state(z_start)
+
+        while True:
+            if verbose:
+                print(f"Segment {z_start} to {z_stop}: segmenting slice {z}")
+
+            seg_prev = segmentation[z - increment]
+            if memory_adapter is not None:
+                seg_z, curr_embed, _, _ = predict_from_memory_state(
+                    predictor=predictor,
+                    memory_state=memory_state,
+                    image_embeddings=image_embeddings,
+                    index=z,
+                    mask_threshold=0.5,
+                )
+                seg_z = seg_z.astype(segmentation.dtype, copy=False)
+            else:
+                seg_z, _, _ = segment_from_mask(
+                    predictor, seg_prev, image_embeddings=image_embeddings, i=z, use_mask=use_mask,
+                    use_box=use_box, use_points=use_points, box_extension=box_extension, return_all=True,
+                    use_single_point=use_single_point,
+                )
+
+            if threshold is not None:
+                iou = util.compute_iou(seg_prev, seg_z)
+                if iou < threshold:
+                    if verbose:
+                        print(f"Segmentation stopped at slice {z} due to IOU {iou} < {threshold}.")
+                    break
+
+            segmentation[z] = seg_z
+            if memory_adapter is not None:
+                memory_state = memory_adapter.update_memory(
+                    memory_state=memory_state,
+                    current_image_embeddings=curr_embed,
+                    current_mask=mask_to_memory_tensor(seg_z, model_device),
+                )
+
+            z += increment
+            if stopping_criterion(z, z_stop):
+                if verbose:
+                    print(f"Segment {z_start} to {z_stop}: stop at slice {z}")
+                break
+            update_progress(1)
+
+        return z - increment
+
+    z0, z1 = int(segmented_slices.min()), int(segmented_slices.max())
+
+    if z0 > 0 and not stop_lower:
+        z_min = segment_range(z0, 0, -1, np.less, iou_threshold, verbose=verbose)
+    else:
+        z_min = z0
+
+    if z1 < segmentation.shape[0] - 1 and not stop_upper:
+        z_max = segment_range(z1, segmentation.shape[0] - 1, 1, np.greater, iou_threshold, verbose=verbose)
+    else:
+        z_max = z1
+
+    if z0 != z1:
+        for z_start, z_stop in zip(segmented_slices[:-1], segmented_slices[1:]):
+            slice_diff = z_stop - z_start
+            z_mid = int((z_start + z_stop) // 2)
+
+            if slice_diff == 1:
+                pass
+            elif z_start == z0 and stop_lower:
+                segment_range(z_stop, z_start, -1, np.less_equal, verbose=verbose)
+            elif z_stop == z1 and stop_upper:
+                segment_range(z_start, z_stop, 1, np.greater_equal, verbose=verbose)
+            elif slice_diff == 2 and memory_adapter is not None:
+                segment_range(z_start, z_start + 1, 1, np.greater_equal, verbose=verbose)
+            elif slice_diff == 2:
+                z = z_start + 1
+                seg_prompt = np.logical_or(segmentation[z_start] == 1, segmentation[z_stop] == 1)
+                segmentation[z] = segment_from_mask(
+                    predictor, seg_prompt, image_embeddings=image_embeddings, i=z,
+                    use_mask=use_mask, use_box=use_box, use_points=use_points,
+                    box_extension=box_extension
+                )
+                update_progress(1)
+            else:
+                segment_range(
+                    z_start, z_mid, 1, np.greater_equal if slice_diff % 2 == 0 else np.greater, verbose=verbose
+                )
+                segment_range(z_stop, z_mid, -1, np.less_equal, verbose=verbose)
+                if slice_diff % 2 == 0:
+                    seg_prompt = np.logical_or(segmentation[z_mid - 1] == 1, segmentation[z_mid + 1] == 1)
+                    segmentation[z_mid] = segment_from_mask(
+                        predictor, seg_prompt, image_embeddings=image_embeddings, i=z_mid,
+                        use_mask=use_mask, use_box=use_box, use_points=use_points,
+                        box_extension=box_extension
+                    )
+                    update_progress(1)
+
     return segmentation, (z_min, z_max)
 
 

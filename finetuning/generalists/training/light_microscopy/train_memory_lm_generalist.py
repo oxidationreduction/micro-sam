@@ -1,5 +1,5 @@
-import os
 import argparse
+import os
 
 import torch
 import torch.distributed as dist
@@ -8,46 +8,86 @@ import micro_sam.training as sam_training
 from micro_sam.sam_annotator.z_memory_adapter import ZMemoryAdapter
 from micro_sam.util import export_custom_sam_model
 
-from obtain_lm_datasets import get_generalist_lm_loaders
+from obtain_lm_datasets import get_generalist_lm_loaders, get_real_sequence_lm_loaders
+
+
+def _resolve_device():
+    if not torch.cuda.is_available():
+        print("CUDA is not available. Falling back to CPU.")
+        return torch.device("cpu"), 0
+
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    torch.cuda.set_device(local_rank)
+    device = torch.device(f"cuda:{local_rank}")
+
+    if "LOCAL_RANK" in os.environ and not dist.is_initialized():
+        dist.init_process_group(backend="nccl")
+        print(f"[Process {local_rank}] Using GPU: {torch.cuda.current_device()}")
+
+    return device, local_rank
 
 
 def finetune_lm_generalist_memory(args):
-    """Code for finetuning SAM with Memory Adapter on multiple Light Microscopy datasets."""
-    # device = "cuda" if torch.cuda.is_available() else "cpu"
-    local_rank = int(os.environ.get("LOCAL_RANK", 2))
+    """Code for finetuning SAM with a memory adapter on light microscopy datasets."""
+    device, _ = _resolve_device()
 
-    # 2. 【最关键的一步】强制当前进程只使用它对应的逻辑 GPU
-    torch.cuda.set_device(local_rank)
-
-    # 3. 定义 device 变量，后续模型和数据都 .to(device)
-    device = torch.device(f"cuda:{local_rank}")
-
-    # 4. 初始化分布式进程组 (如果是真正的 DDP 训练，必须有这一步)
-    if "LOCAL_RANK" in os.environ:
-        dist.init_process_group(backend="nccl")
-        print(f"[Process {local_rank}] Use GPU: {torch.cuda.current_device()}")
-
-    # training settings:
     model_type = args.model_type
-    checkpoint_path = args.checkpoint_path  # 必须加载预微调好的基础模型权重
-
-    # 3D 序列格式，支持 seq_len
-    patch_shape = (args.seq_len, 512, 512)
+    checkpoint_path = args.checkpoint_path
+    patch_shape = (args.seq_len, args.patch_shape[0], args.patch_shape[1])
     n_objects_per_batch = args.n_objects
-    checkpoint_name = f"{model_type}/lm_generalist_memory_sam"
+    checkpoint_name = (
+        f"{model_type}/lm_real_sequence_memory_sam"
+        if args.sequence_dataset_root is not None
+        else f"{model_type}/lm_generalist_memory_sam"
+    )
 
-    # 冻结特征提取模块
     freeze_parts = ["image_encoder", "prompt_encoder"]
+    memory_adapter = ZMemoryAdapter(
+        embed_dim=256,
+        detach_memory=not args.keep_memory_gradients,
+    ).to(device)
 
-    # 实例化 Memory Adapter
-    # (注：SAM的特征维度均为256，因此可以直接传递 embed_dim=256)
-    memory_adapter = ZMemoryAdapter(embed_dim=256).to(device)
+    if args.sequence_dataset_root is not None:
+        batch_size = 1 if args.batch_size is None else args.batch_size
+        num_workers = 0 if args.num_workers is None else args.num_workers
+        print(
+            "Using real tif sequence data for memory training. "
+            "This bypasses the synthetic sequence wrapper used for 2D LM datasets."
+        )
+        print(f"Sequence dataset root(s): {args.sequence_dataset_root}")
+        print(
+            f"Sequence label mode: {args.sequence_label_mode}, "
+            f"require_full_track={not args.allow_partial_tracks}, "
+            f"require_consecutive_slices={not args.allow_slice_gaps}"
+        )
+        train_loader, val_loader = get_real_sequence_lm_loaders(
+            dataset_root=args.sequence_dataset_root,
+            patch_shape=patch_shape,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            val_fraction=args.val_fraction,
+            min_size=args.min_instance_size,
+            min_tracking_length=args.min_tracking_length,
+            seed=args.seed,
+            label_mode=args.sequence_label_mode,
+            require_consecutive_slices=not args.allow_slice_gaps,
+            require_full_track=not args.allow_partial_tracks,
+        )
+    else:
+        batch_size = 9 if args.batch_size is None else args.batch_size
+        num_workers = 24 if args.num_workers is None else args.num_workers
+        print(
+            "Using synthetic sequences created from 2D LM datasets. "
+            "These are not true consecutive microscopy slices."
+        )
+        train_loader, val_loader = get_generalist_lm_loaders(
+            input_path=args.input_path,
+            patch_shape=patch_shape,
+            batch_size=batch_size,
+            num_workers=num_workers,
+        )
 
-    # 获取数据 loaders
-    train_loader, val_loader = get_generalist_lm_loaders(input_path=args.input_path, patch_shape=patch_shape, batch_size=9)
     scheduler_kwargs = {"mode": "min", "factor": 0.9, "patience": 5}
-
-    # --- 修复核心：直接调用我们封装好的 train_mem_sam 高层接口 ---
     sam_training.train_mem_sam(
         name=checkpoint_name,
         model_type=model_type,
@@ -55,34 +95,73 @@ def finetune_lm_generalist_memory(args):
         val_loader=val_loader,
         memory_adapter=memory_adapter,
         seq_len=args.seq_len,
-        early_stopping=None,  # Generalist模型通常避免过早停止
+        early_stopping=None,
         n_objects_per_batch=n_objects_per_batch,
         checkpoint_path=checkpoint_path,
         freeze=freeze_parts,
         device=device,
-        lr=1e-4,  # Memory Adapter 的主学习率
-        decoder_lr=1e-6,  # 保护原生 Mask Decoder 的微小学习率
+        lr=1e-4,
+        decoder_lr=1e-6,
         n_iterations=args.iterations,
         save_root=args.save_root,
         scheduler_kwargs=scheduler_kwargs,
-        mask_prob=0.5
+        mask_prob=0.5,
     )
 
-    # 导出模型供标注工具使用
     if args.export_path is not None:
         best_checkpoint_path = os.path.join(
-            "" if args.save_root is None else args.save_root, "checkpoints", checkpoint_name, "best.pt"
+            "" if args.save_root is None else args.save_root,
+            "checkpoints",
+            checkpoint_name,
+            "best.pt",
         )
         export_custom_sam_model(
-            checkpoint_path=best_checkpoint_path, model_type=model_type, save_path=os.path.join(args.export_path, "vit_l_lm_mem.pt")
+            checkpoint_path=best_checkpoint_path,
+            model_type=model_type,
+            save_path=args.export_path,
         )
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Finetune Segment Anything for the LM datasets.")
+    parser = argparse.ArgumentParser(description="Finetune Segment Anything with a memory adapter.")
     parser.add_argument(
         "--input_path", "-i", default="/home/mira/Downloads/micro-sam/data/light_microscopy/",
-        help="The filepath to all the respective LM datasets. If the data does not exist yet it will be downloaded"
+        help="Path to the LM datasets used for synthetic-sequence training."
+    )
+    parser.add_argument(
+        "--sequence_dataset_root",
+        type=str,
+        default=None,
+        help=(
+            "Optional comma-separated path list to real tif sequence datasets with imagesTr/ and labelsTr/. "
+            "If set, the script trains on these real sequence datasets instead of synthetic sequences."
+        ),
+    )
+    parser.add_argument(
+        "--sequence_label_mode",
+        type=str,
+        default="auto",
+        choices=("auto", "instance", "binary_3d_cc"),
+        help=(
+            "How to interpret labels for real tif sequence datasets. "
+            "'instance' keeps instance ids, 'binary_3d_cc' builds 3D connected components, "
+            "'auto' selects between them based on the label values."
+        ),
+    )
+    parser.add_argument(
+        "--allow_partial_tracks",
+        action="store_true",
+        help="Allow crops where an object is present only in the first few slices instead of the full sequence window.",
+    )
+    parser.add_argument(
+        "--allow_slice_gaps",
+        action="store_true",
+        help="Do not split a tif stack when numeric slice ids have gaps. By default gaps break a volume.",
+    )
+    parser.add_argument(
+        "--keep_memory_gradients",
+        action="store_true",
+        help="Keep gradients through memory states across slices. By default memory states are detached to save VRAM.",
     )
     parser.add_argument(
         "--model_type", "-m", default="vit_l_lm",
@@ -90,25 +169,55 @@ def main():
     )
     parser.add_argument(
         "--save_root", "-s", default="/home/mira/Downloads/micro-sam/data/models/tmp",
-        help="Where to save the checkpoint and logs. By default they will be saved where this script is run from."
+        help="Where to save checkpoints and logs."
     )
     parser.add_argument(
         "--checkpoint_path", "-c", type=str, default=None,
-        help="Path to the pre-finetuned micro-sam generalist model (e.g., lm_generalist.pt)"
+        help="Path to the pre-finetuned micro-sam model used as initialization."
     )
     parser.add_argument(
         "--iterations", type=int, default=int(2e3),
-        help="For how many iterations should the model be trained? By default 2k."
+        help="The number of training iterations."
     )
     parser.add_argument(
         "--export_path", "-e", default="/home/mira/Downloads/micro-sam/data/models/results",
-        help="Where to export the finetuned model to. The exported model can be used in the annotation tools."
+        help="Where to export the finetuned model."
     )
     parser.add_argument(
-        "--n_objects", type=int, default=1, help="The number of instances (objects) per batch used for finetuning."
+        "--n_objects", type=int, default=1,
+        help="The number of instances per batch used for fine-tuning."
     )
     parser.add_argument(
-        "--seq_len", type=int, default=64, help="The number of consecutive frames/slices to load for memory tracking."
+        "--seq_len", type=int, default=64,
+        help="The number of consecutive frames or slices to load for memory tracking."
+    )
+    parser.add_argument(
+        "--patch_shape", type=int, nargs=2, default=[512, 512],
+        help="Spatial patch shape for sequence training as H W."
+    )
+    parser.add_argument(
+        "--batch_size", type=int, default=None,
+        help="Override the default batch size. Defaults to 9 for synthetic sequences and 1 for real sequences."
+    )
+    parser.add_argument(
+        "--num_workers", type=int, default=None,
+        help="Override the default number of data loader workers. Defaults to 24 for synthetic sequences and 0 for real sequences."
+    )
+    parser.add_argument(
+        "--val_fraction", type=float, default=0.2,
+        help="Validation split fraction used for the real tif sequence dataset."
+    )
+    parser.add_argument(
+        "--min_instance_size", type=int, default=10,
+        help="Minimum instance size passed to the distance-transform label target for the real sequence dataset."
+    )
+    parser.add_argument(
+        "--min_tracking_length", type=int, default=4,
+        help="Minimum persistence required for a candidate object when partial tracks are allowed."
+    )
+    parser.add_argument(
+        "--seed", type=int, default=17,
+        help="Random seed used by the real tif sequence dataset."
     )
     args = parser.parse_args()
     finetune_lm_generalist_memory(args)

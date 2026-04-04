@@ -13,7 +13,7 @@ import torch
 from skimage import draw
 from scipy.ndimage import shift
 
-from .z_memory_adapter import get_embedding_tensor
+from .z_memory_adapter import get_module_device, mask_to_memory_tensor, predict_from_memory_state
 from .. import prompt_based_segmentation, util
 from .. import _model_settings as model_settings
 from ..multi_dimensional_segmentation import _validate_projection
@@ -594,13 +594,29 @@ def _shift_object(mask, motion_model):
     return mask_shifted
 
 
-def track_from_prompts(
+def _track_from_prompts_legacy(
     point_prompts, box_prompts, seg, predictor, slices, image_embeddings,
     stop_upper, threshold, projection, motion_smoothing=0.5, box_extension=0, update_progress=None,
     memory_adapter=None, device='cuda'
 ):
     """@private
     """
+    return track_from_prompts(
+        point_prompts=point_prompts,
+        box_prompts=box_prompts,
+        seg=seg,
+        predictor=predictor,
+        slices=slices,
+        image_embeddings=image_embeddings,
+        stop_upper=stop_upper,
+        threshold=threshold,
+        projection=projection,
+        motion_smoothing=motion_smoothing,
+        box_extension=box_extension,
+        update_progress=update_progress,
+        memory_adapter=memory_adapter,
+        device=device,
+    )
     use_box, use_mask, use_points, use_single_point = _validate_projection(projection)
 
     if update_progress is None:
@@ -715,6 +731,124 @@ def track_from_prompts(
             break
 
         # stop if we are at the last slice
+        if t == seg.shape[0]:
+            break
+
+    return seg, has_division
+
+
+def track_from_prompts(
+    point_prompts, box_prompts, seg, predictor, slices, image_embeddings,
+    stop_upper, threshold, projection, motion_smoothing=0.5, box_extension=0, update_progress=None,
+    memory_adapter=None, device='cuda'
+):
+    """@private"""
+    use_box, use_mask, use_points, use_single_point = _validate_projection(projection)
+
+    if update_progress is None:
+        def update_progress(*args):
+            pass
+
+    def _update_motion_model(seg, t, t0, motion_model):
+        if t in (t0, t0 + 1):
+            pass
+        elif t == t0 + 2:
+            current_move = _compute_movement(seg, t - 1, t - 2)
+            motion_model = current_move
+        else:
+            current_move = _compute_movement(seg, t - 1, t - 2)
+            alpha = motion_smoothing
+            motion_model = alpha * motion_model + (1 - alpha) * current_move
+        return motion_model
+
+    has_division = False
+    motion_model = None
+    verbose = False
+
+    model_device = get_module_device(predictor.model)
+    if memory_adapter is not None:
+        predictor.model.memory_adapter = memory_adapter
+
+    memory_state = None
+    t0 = int(slices.min())
+    if memory_adapter is not None:
+        memory_state = memory_adapter.init_memory(batch_size=1, device=model_device)
+        util.set_precomputed(predictor, image_embeddings, t0)
+        memory_state = memory_adapter.update_memory(
+            memory_state=memory_state,
+            current_image_embeddings=predictor.features,
+            current_mask=mask_to_memory_tensor(seg[t0], model_device),
+        )
+
+    t = t0 + 1
+    while True:
+        motion_model = _update_motion_model(seg, t, t0, motion_model)
+        curr_embed = None
+
+        if t in slices:
+            seg_prev = None
+            seg_t = seg[t]
+            track_state = prompt_layer_to_state(point_prompts, t)
+
+            if memory_adapter is not None:
+                util.set_precomputed(predictor, image_embeddings, t)
+                curr_embed = predictor.features
+
+        else:
+            if verbose:
+                print(f"Tracking object in frame {t} with movement {motion_model}")
+
+            seg_prev = seg[t - 1]
+            if motion_model is not None:
+                seg_prev_shifted = _shift_object(seg_prev, motion_model)
+            else:
+                seg_prev_shifted = seg_prev
+
+            if memory_adapter is not None:
+                seg_t, curr_embed, _, _ = predict_from_memory_state(
+                    predictor=predictor,
+                    memory_state=memory_state,
+                    image_embeddings=image_embeddings,
+                    index=t,
+                    mask_threshold=0.5,
+                )
+                seg_t = seg_t.astype(seg.dtype, copy=False)
+            else:
+                seg_t = prompt_based_segmentation.segment_from_mask(
+                    predictor, seg_prev_shifted, image_embeddings=image_embeddings, i=t,
+                    use_mask=use_mask, use_box=use_box, use_points=use_points,
+                    box_extension=box_extension, use_single_point=use_single_point,
+                )
+
+            track_state = "track"
+            if t < slices[-1]:
+                seg_prev = None
+
+            update_progress(1)
+
+        if (threshold is not None) and (seg_prev is not None):
+            iou = util.compute_iou(seg_prev, seg_t)
+            if iou < threshold:
+                msg = f"Segmentation stopped at frame {t} due to IOU {iou} < {threshold}."
+                print(msg)
+                break
+
+        if track_state == "division":
+            has_division = True
+            break
+
+        seg[t] = seg_t
+        if memory_adapter is not None and curr_embed is not None:
+            memory_state = memory_adapter.update_memory(
+                memory_state=memory_state,
+                current_image_embeddings=curr_embed,
+                current_mask=mask_to_memory_tensor(seg_t, model_device),
+            )
+
+        t += 1
+
+        if t == slices[-1] and stop_upper:
+            break
         if t == seg.shape[0]:
             break
 
