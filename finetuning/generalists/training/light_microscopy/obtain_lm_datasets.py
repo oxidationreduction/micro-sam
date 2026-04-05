@@ -12,6 +12,7 @@ from torch_em.data import MinInstanceSampler, ConcatDataset
 from torch_em.transform.label import PerObjectDistanceTransform
 from torch_em.data.datasets.light_microscopy.neurips_cell_seg import to_rgb
 
+from finetuning.generalists.training.light_microscopy.cremi_loader import CremiAlignedSliceDataset
 from finetuning.generalists.training.light_microscopy.real_sequence_loader import (
     RealSequenceTifDataset,
     SequenceWindowToFrameDataset,
@@ -59,18 +60,25 @@ def _cellpose_raw_trafo(x):
     return x
 
 
-def get_concat_lm_datasets(input_path, patch_shape, split_choice):
+def get_concat_lm_datasets(
+    input_path,
+    patch_shape,
+    split_choice,
+    use_label_transform=True,
+    include_cremi=False,
+    cremi_input_path=None,
+):
     assert split_choice in ["train", "val"]
 
     label_dtype = torch.float32
     sampler = MinInstanceSampler(min_size=10)
 
     def _get_label_transform():
-        label_transform = PerObjectDistanceTransform(
+        if not use_label_transform:
+            return None
+        return PerObjectDistanceTransform(
             distances=True, boundary_distances=True, directed_distances=False, foreground=True, instances=True,
         )
-        return label_transform
-        # return None
 
     def get_livecell_datasets():
         "Datasets for cell segmentation in phase contrast microscopy images."
@@ -145,6 +153,20 @@ def get_concat_lm_datasets(input_path, patch_shape, split_choice):
                 )
             )
         return all_ctc_datasets
+
+    def get_cremi_datasets():
+        "Datasets for membrane segmentation in CREMI electron microscopy data."
+        cremi_root = os.path.join(input_path, "cremi") if cremi_input_path is None else cremi_input_path
+        n_samples = 750 if split_choice == "train" else 250
+        return [CremiAlignedSliceDataset(
+            dataset_root=cremi_root,
+            patch_shape=patch_shape,
+            split=split_choice,
+            raw_transform=_identity,
+            label_transform=_get_label_transform(),
+            sampler=sampler,
+            n_samples=n_samples,
+        )]
 
     _datasets = [
         # cell segmentation in tissue microscopy images.
@@ -223,6 +245,9 @@ def get_concat_lm_datasets(input_path, patch_shape, split_choice):
     if split_choice == "train":  # NOTE: We use CTC only for training.
         _datasets.extend(get_ctc_datasets())
 
+    if include_cremi:
+        _datasets.extend(get_cremi_datasets())
+
     generalist_dataset = ConcatDataset(*_datasets)
 
     # Increasing the sampling attempts for the NeurIPS CellSeg dataset.
@@ -231,7 +256,15 @@ def get_concat_lm_datasets(input_path, patch_shape, split_choice):
     return generalist_dataset
 
 
-def get_generalist_lm_loaders(input_path, patch_shape, batch_size=2, num_workers=24):
+def get_generalist_lm_loaders(
+    input_path,
+    patch_shape,
+    batch_size=2,
+    num_workers=24,
+    use_label_transform=True,
+    include_cremi=False,
+    cremi_input_path=None,
+):
     """This returns the concatenated light microscopy datasets implemented in `torch_em`:
     https://github.com/constantinpape/torch-em/tree/main/torch_em/data/datasets/light_microscopy.
     It will automatically download all the datasets, except:
@@ -247,8 +280,22 @@ def get_generalist_lm_loaders(input_path, patch_shape, batch_size=2, num_workers
     """
     # Get the datasets.
     patch_shape_2d = patch_shape[1:]  if len(patch_shape) == 3 else patch_shape
-    generalist_train_dataset = get_concat_lm_datasets(input_path, patch_shape_2d, "train")
-    generalist_val_dataset = get_concat_lm_datasets(input_path, patch_shape_2d, "val")
+    generalist_train_dataset = get_concat_lm_datasets(
+        input_path,
+        patch_shape_2d,
+        "train",
+        use_label_transform=use_label_transform,
+        include_cremi=include_cremi,
+        cremi_input_path=cremi_input_path,
+    )
+    generalist_val_dataset = get_concat_lm_datasets(
+        input_path,
+        patch_shape_2d,
+        "val",
+        use_label_transform=use_label_transform,
+        include_cremi=include_cremi,
+        cremi_input_path=cremi_input_path,
+    )
 
     if len(patch_shape) == 3:
         # If the patch shape is 3D, we wrap the datasets in a sequence wrapper that creates synthetic sequences.
@@ -278,6 +325,7 @@ def get_real_sequence_lm_loaders(
     label_mode="auto",
     require_consecutive_slices=True,
     require_full_track=True,
+    use_label_transform=False,
 ):
     """Build loaders for a real tif sequence dataset.
 
@@ -302,6 +350,7 @@ def get_real_sequence_lm_loaders(
         "label_mode": label_mode,
         "require_consecutive_slices": require_consecutive_slices,
         "require_full_track": require_full_track,
+        "use_label_transform": use_label_transform,
     }
 
     if isinstance(dataset_root, (list, tuple)):
@@ -345,6 +394,7 @@ def get_real_sequence_frame_lm_loaders(
     require_consecutive_slices=True,
     require_full_track=True,
     frame_indices=None,
+    use_label_transform=True,
 ):
     """Build 2D loaders from the same real tif sequence windows used by memory training.
 
@@ -366,6 +416,7 @@ def get_real_sequence_frame_lm_loaders(
         "label_mode": label_mode,
         "require_consecutive_slices": require_consecutive_slices,
         "require_full_track": require_full_track,
+        "use_label_transform": use_label_transform,
     }
 
     if isinstance(dataset_root, (list, tuple)):

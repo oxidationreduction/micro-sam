@@ -26,8 +26,8 @@ def _resolve_device():
     return device, local_rank
 
 
-def _get_freeze_parts(train_full_model: bool):
-    if train_full_model:
+def _get_freeze_parts(freeze_backbone_like_memory: bool):
+    if not freeze_backbone_like_memory:
         return None
     return ["image_encoder", "prompt_encoder"]
 
@@ -41,7 +41,7 @@ def finetune_lm_generalist_plain(args):
     n_objects_per_batch = args.n_objects
     sequence_patch_shape = (args.seq_len, args.patch_shape[0], args.patch_shape[1])
     spatial_patch_shape = (args.patch_shape[0], args.patch_shape[1])
-    freeze_parts = _get_freeze_parts(args.train_full_model)
+    freeze_parts = _get_freeze_parts(args.freeze_backbone_like_memory)
     checkpoint_name = (
         f"{model_type}/lm_real_sequence_plain_sam"
         if args.sequence_dataset_root is not None
@@ -77,6 +77,7 @@ def finetune_lm_generalist_plain(args):
             label_mode=args.sequence_label_mode,
             require_consecutive_slices=not args.allow_slice_gaps,
             require_full_track=not args.allow_partial_tracks,
+            use_label_transform=True,
         )
     else:
         batch_size = 4 if args.batch_size is None else args.batch_size
@@ -91,6 +92,9 @@ def finetune_lm_generalist_plain(args):
             patch_shape=spatial_patch_shape,
             batch_size=batch_size,
             num_workers=num_workers,
+            use_label_transform=True,
+            include_cremi=args.include_cremi,
+            cremi_input_path=args.cremi_input_path,
         )
 
     scheduler_kwargs = {"mode": "min", "factor": 0.9, "patience": 5}
@@ -171,20 +175,31 @@ def main():
         help="Do not split a tif stack when numeric slice ids have gaps. By default gaps break a volume.",
     )
     parser.add_argument(
-        "--train_full_model",
+        "--freeze_backbone_like_memory",
         action="store_true",
         help=(
-            "Train the full SAM model. By default the script freezes image_encoder and prompt_encoder "
-            "to better match the memory-adapter comparison setup."
+            "Freeze image_encoder and prompt_encoder to better match the memory-adapter comparison setup. "
+            "By default the plain baseline follows the original micro-sam behavior and trains the full model."
         ),
     )
     parser.add_argument(
-        "--with_segmentation_decoder",
+        "--disable_segmentation_decoder",
         action="store_true",
         help=(
-            "Also train the additional UNETR segmentation decoder. Disabled by default to keep the baseline "
-            "closer to the memory-adapter comparison."
+            "Disable the additional UNETR segmentation decoder. By default the plain baseline keeps the "
+            "original micro-sam LM generalist behavior and trains with the segmentation decoder."
         ),
+    )
+    parser.add_argument(
+        "--include_cremi",
+        action="store_true",
+        help="Also include CREMI in the 2D generalist training set when sequence_dataset_root is not set.",
+    )
+    parser.add_argument(
+        "--cremi_input_path",
+        type=str,
+        default="/mnt/mira_datacenter/liuhongyu2024/project/micro-sam/data/cremi/",
+        help="Path to the CREMI dataset root used when --include_cremi is enabled.",
     )
     parser.add_argument(
         "--model_type", "-m", default="vit_l_lm",
@@ -247,6 +262,7 @@ def main():
         help="Learning rate for plain-SAM finetuning."
     )
     args = parser.parse_args()
+    args.with_segmentation_decoder = not args.disable_segmentation_decoder
     finetune_lm_generalist_plain(args)
 
 

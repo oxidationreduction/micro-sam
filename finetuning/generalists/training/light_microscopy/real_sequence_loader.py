@@ -48,6 +48,7 @@ class RealSequenceTifDataset(Dataset):
         label_mode: str = "auto",
         require_consecutive_slices: bool = True,
         require_full_track: bool = True,
+        use_label_transform: bool = False,
     ) -> None:
         if split not in ("train", "val"):
             raise ValueError(f"Invalid split: {split}")
@@ -67,13 +68,17 @@ class RealSequenceTifDataset(Dataset):
         self.label_mode = label_mode
         self.require_consecutive_slices = require_consecutive_slices
         self.require_full_track = require_full_track
-        self.label_transform = PerObjectDistanceTransform(
-            distances=True,
-            boundary_distances=True,
-            directed_distances=False,
-            foreground=True,
-            instances=True,
-            min_size=min_size,
+        self.use_label_transform = bool(use_label_transform)
+        self.label_transform = (
+            PerObjectDistanceTransform(
+                distances=True,
+                boundary_distances=True,
+                directed_distances=False,
+                foreground=True,
+                instances=True,
+                min_size=min_size,
+            )
+            if self.use_label_transform else None
         )
 
         self.volume_entries = self._collect_volumes(self.dataset_root, self.seq_len, self.require_consecutive_slices)
@@ -91,7 +96,8 @@ class RealSequenceTifDataset(Dataset):
             f"[RealSequenceTifDataset] split={self.split} root={self.dataset_root} "
             f"volumes={len(self.volume_entries)} slices={total_slices} "
             f"instances={total_instances} windows={len(self.windows)} "
-            f"patch_shape={self.patch_shape} label_mode={self.label_mode}"
+            f"patch_shape={self.patch_shape} label_mode={self.label_mode} "
+            f"use_label_transform={self.use_label_transform}"
         )
 
     @staticmethod
@@ -392,6 +398,10 @@ class RealSequenceTifDataset(Dataset):
         return torch.from_numpy(image_tensor)
 
     def _to_label_tensor(self, sequence_labels: np.ndarray) -> torch.Tensor:
+        if self.label_transform is None:
+            label_tensor = sequence_labels[:, None, :, :].astype(np.float32, copy=False)
+            return torch.from_numpy(label_tensor)
+
         transformed = [
             self.label_transform(label_slice.astype(np.int64, copy=False)).astype(np.float32, copy=False)
             for label_slice in sequence_labels

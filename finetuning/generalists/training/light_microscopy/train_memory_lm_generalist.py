@@ -72,6 +72,7 @@ def finetune_lm_generalist_memory(args):
             label_mode=args.sequence_label_mode,
             require_consecutive_slices=not args.allow_slice_gaps,
             require_full_track=not args.allow_partial_tracks,
+            use_label_transform=False,
         )
     else:
         batch_size = 9 if args.batch_size is None else args.batch_size
@@ -85,6 +86,9 @@ def finetune_lm_generalist_memory(args):
             patch_shape=patch_shape,
             batch_size=batch_size,
             num_workers=num_workers,
+            use_label_transform=False,
+            include_cremi=args.include_cremi,
+            cremi_input_path=args.cremi_input_path,
         )
 
     scheduler_kwargs = {"mode": "min", "factor": 0.9, "patience": 5}
@@ -127,6 +131,17 @@ def main():
     parser.add_argument(
         "--input_path", "-i", default="/home/mira/Downloads/micro-sam/data/light_microscopy/",
         help="Path to the LM datasets used for synthetic-sequence training."
+    )
+    parser.add_argument(
+        "--include_cremi",
+        action="store_true",
+        help="Also include CREMI in the synthetic generalist training set when sequence_dataset_root is not set.",
+    )
+    parser.add_argument(
+        "--cremi_input_path",
+        type=str,
+        default="/mnt/mira_datacenter/liuhongyu2024/project/micro-sam/data/cremi/",
+        help="Path to the CREMI dataset root used when --include_cremi is enabled.",
     )
     parser.add_argument(
         "--sequence_dataset_root",
